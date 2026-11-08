@@ -1,0 +1,42 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Rust / Tauri build artifacts
+src-tauri/target/
+
+# Python virtual environments and caches (e.g. local AnyMD setup)
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local notes, logs, and environment settings
+note.txt
+.env
+.env.*
+!.env.example
+
+# Downloaded local dependency archives
+*.tgz
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
