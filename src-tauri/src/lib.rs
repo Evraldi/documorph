@@ -5,7 +5,10 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -13,11 +16,15 @@ use tauri::{AppHandle, Manager};
 use wait_timeout::ChildExt;
 
 static CANCEL_CONVERSION: AtomicBool = AtomicBool::new(false);
+static ANYMD_EXECUTABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
+static PDF2DOCX_EXECUTABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
+static PDFIUM_INSTANCE: OnceLock<Result<Pdfium, String>> = OnceLock::new();
 
 #[derive(Serialize)]
 struct EngineStatus {
     pandoc: bool,
     anymd: bool,
+    pdf2docx: bool,
     libreoffice: bool,
     typst: bool,
     ocrmypdf: bool,
@@ -47,12 +54,51 @@ struct ConversionReport {
     warning: Option<String>,
 }
 
+#[cfg(windows)]
+fn hide_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+}
+
+#[cfg(not(windows))]
+fn hide_console(_command: &mut Command) {}
+
 fn locate(program: &str, candidates: &[PathBuf]) -> Option<PathBuf> {
     which::which(program)
         .ok()
         .or_else(|| candidates.iter().find(|p| p.is_file()).cloned())
 }
+fn is_anymd_cli(path: &Path) -> bool {
+    let mut command = Command::new(path);
+    command
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    hide_console(&mut command);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let Ok(Some(status)) = child.wait_timeout(Duration::from_secs(3)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    if !status.success() {
+        return false;
+    }
+    let mut version = String::new();
+    let _ = child
+        .stdout
+        .take()
+        .is_some_and(|mut stdout| stdout.read_to_string(&mut version).is_ok());
+    version.trim_start().starts_with("anymd ")
+}
+
 fn anymd_path() -> Option<PathBuf> {
+    ANYMD_EXECUTABLE.get_or_init(discover_anymd_path).clone()
+}
+
+fn discover_anymd_path() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(configured) = std::env::var_os("ANYMD_PATH") {
         candidates.push(PathBuf::from(configured));
@@ -66,8 +112,37 @@ fn anymd_path() -> Option<PathBuf> {
             candidates.push(dir.join("anymd.exe"));
         }
     }
+    candidates
+        .into_iter()
+        .filter(|path| path.is_file())
+        .find(|path| is_anymd_cli(path))
+}
+fn pdf2docx_path() -> Option<PathBuf> {
+    PDF2DOCX_EXECUTABLE
+        .get_or_init(discover_pdf2docx_path)
+        .clone()
+}
+
+fn discover_pdf2docx_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(configured) = std::env::var_os("PDF2DOCX_PATH") {
+        candidates.push(PathBuf::from(configured));
+    }
+    if let Some(scripts) = std::env::var_os("ANYMD_PATH")
+        .and_then(|anymd| PathBuf::from(anymd).parent().map(Path::to_path_buf))
+    {
+        candidates.push(scripts.join("pdf2docx.exe"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(local).join("Programs/anymd-venv/Scripts/pdf2docx.exe"));
+    }
+    candidates.push(PathBuf::from(r"C:\Data\anymd-venv\Scripts\pdf2docx.exe"));
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("pdf2docx.exe")));
+    }
     candidates.into_iter().find(|path| path.is_file())
 }
+
 fn pandoc_path() -> Option<PathBuf> {
     let mut paths = vec![
         PathBuf::from(r"C:\Program Files\Pandoc\pandoc.exe"),
@@ -119,6 +194,8 @@ fn history_connection(app: &AppHandle) -> Result<Connection, String> {
         .map_err(|e| format!("Tidak dapat membuat folder data aplikasi: {e}"))?;
     let conn = Connection::open(dir.join("history.sqlite3"))
         .map_err(|e| format!("Tidak dapat membuka database riwayat: {e}"))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| format!("Tidak dapat mengatur timeout database riwayat: {e}"))?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, name TEXT NOT NULL, output TEXT NOT NULL, engine TEXT NOT NULL, tier TEXT NOT NULL, at INTEGER NOT NULL);")
         .map_err(|e| format!("Tidak dapat menyiapkan database riwayat: {e}"))?;
     Ok(conn)
@@ -188,6 +265,7 @@ fn engine_status() -> EngineStatus {
     EngineStatus {
         pandoc: pandoc_path().is_some(),
         anymd: anymd_path().is_some(),
+        pdf2docx: pdf2docx_path().is_some(),
         libreoffice: libreoffice_path().is_some(),
         typst: typst_path().is_some(),
         ocrmypdf: ocrmypdf_path().is_some(),
@@ -197,6 +275,7 @@ fn engine_status() -> EngineStatus {
 }
 
 fn run_engine(command: &mut Command, name: &str) -> Result<(), String> {
+    hide_console(command);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
@@ -231,6 +310,8 @@ fn run_engine(command: &mut Command, name: &str) -> Result<(), String> {
         if started.elapsed() >= Duration::from_secs(180) {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = out_reader.join();
+            let _ = err_reader.join();
             return Err(format!("{name} melewati batas waktu 180 detik."));
         }
         if let Some(status) = child
@@ -282,10 +363,15 @@ fn pdfium_library_path(app: &AppHandle) -> Option<PathBuf> {
 }
 
 fn inspect_pdf(app: &AppHandle, path: &Path) -> Result<Vec<String>, String> {
-    let library = pdfium_library_path(app).ok_or("PDFium DLL tidak ditemukan.")?;
-    let bindings =
-        Pdfium::bind_to_library(library).map_err(|e| format!("Gagal memuat PDFium: {e}"))?;
-    let pdfium = Pdfium::new(bindings);
+    // pdfium-render bindings are process-global. Initialize one shared instance and reuse it.
+    let pdfium = PDFIUM_INSTANCE.get_or_init(|| {
+        let library =
+            pdfium_library_path(app).ok_or_else(|| "PDFium DLL tidak ditemukan.".to_string())?;
+        let bindings =
+            Pdfium::bind_to_library(library).map_err(|e| format!("Gagal memuat PDFium: {e}"))?;
+        Ok(Pdfium::new(bindings))
+    });
+    let pdfium = pdfium.as_ref().map_err(Clone::clone)?;
     let document = pdfium.load_pdf_from_file(path, None).map_err(|e| {
         format!("PDF tidak dapat dibuka (mungkin rusak atau dilindungi password): {e}")
     })?;
@@ -356,6 +442,11 @@ fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String>
         std::fs::File::open(path).map_err(|e| format!("Tidak dapat membuka dokumen: {e}"))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| format!("Dokumen {ext} rusak atau bukan arsip Office valid: {e}"))?;
+    if archive.len() > 10_000 {
+        return Err(format!(
+            "Arsip {ext} memiliki terlalu banyak entri untuk diperiksa dengan aman."
+        ));
+    }
     let xml_names: Vec<String> = (0..archive.len())
         .filter_map(|i| {
             archive
@@ -376,13 +467,23 @@ fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String>
     }
     let mut referenced = std::collections::HashSet::new();
     for name in xml_names {
-        let mut entry = archive
+        let entry = archive
             .by_name(&name)
             .map_err(|e| format!("Dokumen Office tidak lengkap ({name}): {e}"))?;
-        let mut xml = String::new();
+        const MAX_XML_BYTES: u64 = 32 * 1024 * 1024;
+        if entry.size() > MAX_XML_BYTES {
+            return Err(format!(
+                "XML dokumen terlalu besar untuk diperiksa dengan aman ({name})."
+            ));
+        }
+        let mut xml = String::with_capacity(entry.size() as usize);
         entry
+            .take(MAX_XML_BYTES + 1)
             .read_to_string(&mut xml)
             .map_err(|e| format!("XML dokumen tidak valid ({name}): {e}"))?;
+        if xml.len() as u64 > MAX_XML_BYTES {
+            return Err(format!("XML dokumen melewati batas ukuran aman ({name})."));
+        }
         for marker in ["w:rFonts", "typeface="] {
             let mut remaining = xml.as_str();
             while let Some(pos) = remaining.find(marker) {
@@ -578,9 +679,12 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
         ["md", "markdown", "html", "htm", "txt", "epub", "tex"].contains(&ext.as_str());
     let pandoc_output = ["docx", "md", "html", "txt", "odt", "rtf"].contains(&target_ext);
     let office_output = ["pdf", "docx", "odt", "rtf"].contains(&target_ext);
-    let route_supported = if target_ext == "md" {
+    let route_supported = if pdf_input && target_ext == "docx" && pdf2docx_path().is_some() {
+        true
+    } else if target_ext == "md" {
         anymd_path().is_some()
-    } else if pdf_input && target_ext == "docx" && anymd_path().is_some() && pandoc_path().is_some() {
+    } else if pdf_input && target_ext == "docx" && anymd_path().is_some() && pandoc_path().is_some()
+    {
         true
     } else if pdf_input {
         ["docx", "txt", "html", "odt", "rtf"].contains(&target_ext) && libreoffice_path().is_some()
@@ -602,20 +706,34 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
             "Rute konversi .{ext} ke {target} tidak didukung atau engine yang diperlukan tidak tersedia."
         ));
     }
-    let (engine, tier, warning) = if target_ext == "md" {
+    let (engine, tier, warning) = if pdf_input && target_ext == "docx" && pdf2docx_path().is_some()
+    {
+        let converter = pdf2docx_path().ok_or("pdf2docx tidak ditemukan.")?;
+        let mut cmd = Command::new(converter);
+        cmd.args(["convert"]).arg(source).arg("-d").arg(&output);
+        run_engine_for_output(&mut cmd, "pdf2docx", &output)?;
+        ("pdf2docx", "B", Some("PDF direkonstruksi menjadi elemen DOCX yang dapat diedit. Kemiripan bergantung pada struktur PDF; scan, layout kompleks, dan font khusus dapat memerlukan koreksi.".into()))
+    } else if target_ext == "md" {
         let anymd = anymd_path().ok_or("AnyMD tidak ditemukan.")?;
         let mut cmd = Command::new(anymd);
         cmd.args(["convert"]).arg(source).arg("-o").arg(&output);
         run_engine_for_output(&mut cmd, "AnyMD", &output)?;
         ("AnyMD", "B", Some("Markdown berfokus pada struktur dan teks; tata letak visual, sebagian tabel, dan elemen non-teks dapat berubah atau tidak ikut.".into()))
-    } else if pdf_input && target_ext == "docx" && anymd_path().is_some() && pandoc_path().is_some() {
+    } else if pdf_input && target_ext == "docx" && anymd_path().is_some() && pandoc_path().is_some()
+    {
         let anymd = anymd_path().ok_or("AnyMD tidak ditemukan.")?;
         let pandoc = pandoc_path().ok_or("Pandoc tidak ditemukan.")?;
-        let temp = tempfile::Builder::new().prefix("documorph-anymd-").tempdir()
+        let temp = tempfile::Builder::new()
+            .prefix("documorph-anymd-")
+            .tempdir()
             .map_err(|e| format!("Gagal membuat file sementara: {e}"))?;
         let markdown = temp.path().join("extracted.md");
         let mut extract = Command::new(anymd);
-        extract.args(["convert"]).arg(source).arg("-o").arg(&markdown);
+        extract
+            .args(["convert"])
+            .arg(source)
+            .arg("-o")
+            .arg(&markdown);
         run_engine_for_output(&mut extract, "AnyMD (PDF to Markdown)", &markdown)?;
         let mut build_docx = Command::new(pandoc);
         build_docx.arg(&markdown).arg("-o").arg(&output);
