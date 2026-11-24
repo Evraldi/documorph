@@ -18,19 +18,53 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self' asset:",
+        "connect-src": "ipc: http://ipc.localhost",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' asset: data: blob:",
+        "font-src": "'self' data:",
+        "object-src": "'none'",
+        "base-uri": "'none'"
+      },
+      "devCsp": {
+        "default-src": "'self' asset:",
+        "connect-src": "ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420 http://localhost:1421 ws://localhost:1421",
+        "script-src": "'self' 'unsafe-inline' 'unsafe-eval'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' asset: data: blob:",
+        "font-src": "'self' data:",
+        "object-src": "'none'",
+        "base-uri": "'none'"
+      }
     }
   },
-    "bundle": {
+  "bundle": {
     "active": true,
-    "resources": ["bin/pdfium.dll"],
-    "targets": "all",
+    "resources": {
+      "bin/pdfium.dll": "bin/pdfium.dll",
+      "licenses/*": "licenses/"
+    },
+    "targets": ["nsis", "msi"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "wix": {
+        "upgradeCode": "7b01beeb-b77f-4266-8769-665a2637aa75"
+      },
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

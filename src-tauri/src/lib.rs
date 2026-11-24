@@ -1,23 +1,24 @@
 use pdfium_render::prelude::*;
 use rusqlite::{Connection, params};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
-    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::{
         OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
-use wait_timeout::ChildExt;
+
+mod engines;
+mod limits;
+mod output_guard;
+mod pdfium_guard;
+mod process;
 
 static CANCEL_CONVERSION: AtomicBool = AtomicBool::new(false);
-static ANYMD_EXECUTABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
-static PDF2DOCX_EXECUTABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
 static PDFIUM_INSTANCE: OnceLock<Result<Pdfium, String>> = OnceLock::new();
 
 #[derive(Serialize)]
@@ -31,12 +32,14 @@ struct EngineStatus {
     tesseract: bool,
     ghostscript: bool,
 }
+
 #[derive(Serialize)]
 struct PreflightReport {
     size_bytes: u64,
     warnings: Vec<String>,
 }
-#[derive(Serialize, Deserialize)]
+
+#[derive(Serialize)]
 struct HistoryItem {
     name: String,
     output: String,
@@ -54,135 +57,29 @@ struct ConversionReport {
     warning: Option<String>,
 }
 
-#[cfg(windows)]
-fn hide_console(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-}
-
-#[cfg(not(windows))]
-fn hide_console(_command: &mut Command) {}
-
-fn locate(program: &str, candidates: &[PathBuf]) -> Option<PathBuf> {
-    which::which(program)
-        .ok()
-        .or_else(|| candidates.iter().find(|p| p.is_file()).cloned())
-}
-fn is_anymd_cli(path: &Path) -> bool {
-    let mut command = Command::new(path);
-    command
-        .arg("--version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    hide_console(&mut command);
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    let Ok(Some(status)) = child.wait_timeout(Duration::from_secs(3)) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return false;
-    };
-    if !status.success() {
-        return false;
-    }
-    let mut version = String::new();
-    let _ = child
-        .stdout
-        .take()
-        .is_some_and(|mut stdout| stdout.read_to_string(&mut version).is_ok());
-    version.trim_start().starts_with("anymd ")
-}
-
 fn anymd_path() -> Option<PathBuf> {
-    ANYMD_EXECUTABLE.get_or_init(discover_anymd_path).clone()
-}
-
-fn discover_anymd_path() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(configured) = std::env::var_os("ANYMD_PATH") {
-        candidates.push(PathBuf::from(configured));
-    }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(local).join("Programs/anymd-venv/Scripts/anymd.exe"));
-    }
-    candidates.push(PathBuf::from(r"C:\Data\anymd-venv\Scripts\anymd.exe"));
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            candidates.push(dir.join("anymd.exe"));
-        }
-    }
-    candidates
-        .into_iter()
-        .filter(|path| path.is_file())
-        .find(|path| is_anymd_cli(path))
+    engines::engine_paths().anymd.clone()
 }
 fn pdf2docx_path() -> Option<PathBuf> {
-    PDF2DOCX_EXECUTABLE
-        .get_or_init(discover_pdf2docx_path)
-        .clone()
+    engines::engine_paths().pdf2docx.clone()
 }
-
-fn discover_pdf2docx_path() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(configured) = std::env::var_os("PDF2DOCX_PATH") {
-        candidates.push(PathBuf::from(configured));
-    }
-    if let Some(scripts) = std::env::var_os("ANYMD_PATH")
-        .and_then(|anymd| PathBuf::from(anymd).parent().map(Path::to_path_buf))
-    {
-        candidates.push(scripts.join("pdf2docx.exe"));
-    }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(local).join("Programs/anymd-venv/Scripts/pdf2docx.exe"));
-    }
-    candidates.push(PathBuf::from(r"C:\Data\anymd-venv\Scripts\pdf2docx.exe"));
-    if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("pdf2docx.exe")));
-    }
-    candidates.into_iter().find(|path| path.is_file())
-}
-
 fn pandoc_path() -> Option<PathBuf> {
-    let mut paths = vec![
-        PathBuf::from(r"C:\Program Files\Pandoc\pandoc.exe"),
-        PathBuf::from(r"C:\Tools\Pandoc\pandoc.exe"),
-    ];
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        paths.push(PathBuf::from(local).join("Pandoc/pandoc.exe"));
-    }
-    locate("pandoc", &paths)
+    engines::engine_paths().pandoc.clone()
 }
 fn libreoffice_path() -> Option<PathBuf> {
-    locate(
-        "soffice",
-        &[
-            PathBuf::from(r"C:\Program Files\LibreOffice\program\soffice.exe"),
-            PathBuf::from(r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"),
-        ],
-    )
+    engines::engine_paths().libreoffice.clone()
 }
 fn typst_path() -> Option<PathBuf> {
-    locate("typst", &[])
+    engines::engine_paths().typst.clone()
 }
 fn ocrmypdf_path() -> Option<PathBuf> {
-    locate("ocrmypdf", &[])
+    engines::engine_paths().ocrmypdf.clone()
 }
 fn tesseract_path() -> Option<PathBuf> {
-    locate(
-        "tesseract",
-        &[PathBuf::from(
-            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        )],
-    )
+    engines::engine_paths().tesseract.clone()
 }
 fn ghostscript_path() -> Option<PathBuf> {
-    locate(
-        "gswin64c",
-        &[PathBuf::from(
-            r"C:\Program Files\gs\gs10.08.0\bin\gswin64c.exe",
-        )],
-    )
+    engines::engine_paths().ghostscript.clone()
 }
 
 fn history_connection(app: &AppHandle) -> Result<Connection, String> {
@@ -201,22 +98,75 @@ fn history_connection(app: &AppHandle) -> Result<Connection, String> {
     Ok(conn)
 }
 
-#[tauri::command]
-fn reveal_output(path: String) -> Result<(), String> {
-    let output = PathBuf::from(&path);
-    if !output.is_file() {
-        return Err(format!("Output file does not exist: {}", output.display()));
+fn insert_history_record(app: &AppHandle, item: &HistoryItem) -> Result<(), String> {
+    let conn = history_connection(app)?;
+    conn.execute(
+        "INSERT INTO history (name, output, engine, tier, at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![item.name, item.output, item.engine, item.tier, item.at],
+    )
+    .map_err(|e| format!("Gagal menyimpan riwayat: {e}"))?;
+    conn.execute("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY at DESC, id DESC LIMIT 100)", [])
+        .map_err(|e| format!("Gagal membatasi riwayat: {e}"))?;
+    Ok(())
+}
+
+/// Riwayat hanya boleh ditulis oleh `convert_file`, bukan oleh frontend.
+fn record_history(app: &AppHandle, source: &Path, report: &ConversionReport) -> Result<(), String> {
+    let name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output")
+        .to_owned();
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis() as i64;
+    insert_history_record(
+        app,
+        &HistoryItem {
+            name,
+            output: report.output.clone(),
+            engine: report.engine.clone(),
+            tier: report.tier.clone(),
+            at,
+        },
+    )
+}
+
+fn allowed_output_keys(app: &AppHandle) -> Result<Vec<String>, String> {
+    let conn = history_connection(app)?;
+    let mut statement = conn
+        .prepare("SELECT output FROM history")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    let mut keys = Vec::new();
+    for row in rows.flatten() {
+        if let Ok(key) = output_guard::canonical_key(Path::new(&row)) {
+            keys.push(key);
+        }
     }
+    Ok(keys)
+}
+
+fn ensure_output_path(app: &AppHandle, path: &Path) -> Result<(), String> {
+    let allowed = allowed_output_keys(app)?;
+    output_guard::validate(path, &allowed)
+}
+
+#[tauri::command]
+fn reveal_output(app: AppHandle, path: String) -> Result<(), String> {
+    let output = PathBuf::from(&path);
+    ensure_output_path(&app, &output)?;
     tauri_plugin_opener::reveal_item_in_dir(output)
         .map_err(|e| format!("Could not reveal output: {e}"))
 }
 
 #[tauri::command]
-fn open_output(path: String) -> Result<(), String> {
+fn open_output(app: AppHandle, path: String) -> Result<(), String> {
     let output = PathBuf::from(&path);
-    if !output.is_file() {
-        return Err(format!("Output file does not exist: {}", output.display()));
-    }
+    ensure_output_path(&app, &output)?;
     tauri_plugin_opener::open_path(output.to_string_lossy().into_owned(), None::<&str>)
         .map_err(|e| format!("Could not open output: {e}"))
 }
@@ -224,32 +174,21 @@ fn open_output(path: String) -> Result<(), String> {
 #[tauri::command]
 fn history_list(app: AppHandle) -> Result<Vec<HistoryItem>, String> {
     let conn = history_connection(&app)?;
-    let mut stmt = conn.prepare("SELECT name, output, engine, tier, at FROM history ORDER BY at DESC, id DESC LIMIT 100")
+    let mut statement = conn.prepare("SELECT name, output, engine, tier, at FROM history ORDER BY at DESC, id DESC LIMIT 100")
         .map_err(|e| e.to_string())?;
-    stmt.query_map([], |row| {
-        Ok(HistoryItem {
-            name: row.get(0)?,
-            output: row.get(1)?,
-            engine: row.get(2)?,
-            tier: row.get(3)?,
-            at: row.get(4)?,
+    statement
+        .query_map([], |row| {
+            Ok(HistoryItem {
+                name: row.get(0)?,
+                output: row.get(1)?,
+                engine: row.get(2)?,
+                tier: row.get(3)?,
+                at: row.get(4)?,
+            })
         })
-    })
-    .map_err(|e| e.to_string())?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn history_add(app: AppHandle, item: HistoryItem) -> Result<(), String> {
-    let conn = history_connection(&app)?;
-    conn.execute(
-        "INSERT INTO history (name, output, engine, tier, at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![item.name, item.output, item.engine, item.tier, item.at],
-    )
-    .map_err(|e| format!("Gagal menyimpan riwayat: {e}"))?;
-    conn.execute("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY at DESC, id DESC LIMIT 100)", []).map_err(|e| format!("Gagal membatasi riwayat: {e}"))?;
-    Ok(())
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -274,72 +213,8 @@ fn engine_status() -> EngineStatus {
     }
 }
 
-fn run_engine(command: &mut Command, name: &str) -> Result<(), String> {
-    hide_console(command);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Gagal menjalankan {name}: {e}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("Tidak dapat membaca output engine.")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or("Tidak dapat membaca error engine.")?;
-    let out_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = std::io::BufReader::new(stdout).read_to_end(&mut bytes);
-        bytes
-    });
-    let err_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = std::io::BufReader::new(stderr).read_to_end(&mut bytes);
-        bytes
-    });
-    let started = Instant::now();
-    let status = loop {
-        if CANCEL_CONVERSION.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = out_reader.join();
-            let _ = err_reader.join();
-            return Err("Konversi dibatalkan.".into());
-        }
-        if started.elapsed() >= Duration::from_secs(180) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = out_reader.join();
-            let _ = err_reader.join();
-            return Err(format!("{name} melewati batas waktu 180 detik."));
-        }
-        if let Some(status) = child
-            .wait_timeout(Duration::from_millis(250))
-            .map_err(|e| format!("Gagal menunggu {name}: {e}"))?
-        {
-            break status;
-        }
-    };
-    let _ = out_reader.join();
-    let stderr = err_reader.join().unwrap_or_default();
-    if status.success() {
-        Ok(())
-    } else {
-        let text = String::from_utf8_lossy(&stderr);
-        Err(format!(
-            "{name} gagal: {}",
-            if text.trim().is_empty() {
-                "proses keluar dengan status gagal"
-            } else {
-                text.trim()
-            }
-        ))
-    }
-}
-
 fn run_engine_for_output(command: &mut Command, name: &str, output: &Path) -> Result<(), String> {
-    if let Err(error) = run_engine(command, name) {
+    if let Err(error) = process::run_engine(command, name, &CANCEL_CONVERSION) {
         let _ = std::fs::remove_file(output);
         return Err(error);
     }
@@ -353,20 +228,26 @@ fn run_engine_for_output(command: &mut Command, name: &str, output: &Path) -> Re
 }
 
 fn pdfium_library_path(app: &AppHandle) -> Option<PathBuf> {
-    let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin/pdfium.dll");
-    if bundled.is_file() {
-        return Some(bundled);
+    let mut candidates = Vec::new();
+    if cfg!(debug_assertions) {
+        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin/pdfium.dll"));
     }
-    app.path()
+    if let Ok(resource) = app
+        .path()
         .resolve("bin/pdfium.dll", tauri::path::BaseDirectory::Resource)
-        .ok()
+    {
+        candidates.push(resource);
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.is_file() && pdfium_guard::verify(path).is_ok())
 }
 
 fn inspect_pdf(app: &AppHandle, path: &Path) -> Result<Vec<String>, String> {
-    // pdfium-render bindings are process-global. Initialize one shared instance and reuse it.
+    // Binding PDFium bersifat global; satu instance dipakai ulang.
     let pdfium = PDFIUM_INSTANCE.get_or_init(|| {
-        let library =
-            pdfium_library_path(app).ok_or_else(|| "PDFium DLL tidak ditemukan.".to_string())?;
+        let library = pdfium_library_path(app)
+            .ok_or_else(|| "PDFium DLL tidak ditemukan atau tidak valid.".to_string())?;
         let bindings =
             Pdfium::bind_to_library(library).map_err(|e| format!("Gagal memuat PDFium: {e}"))?;
         Ok(Pdfium::new(bindings))
@@ -379,21 +260,46 @@ fn inspect_pdf(app: &AppHandle, path: &Path) -> Result<Vec<String>, String> {
     if page_count == 0 {
         return Err("PDF tidak memiliki halaman.".into());
     }
+    let (scan_count, truncated_pages) = limits::page_scan_limit(page_count);
     let mut pages_with_text = 0usize;
-    for page in document.pages().iter() {
+    let mut total_chars = 0usize;
+    let mut truncated_text = false;
+    for page in document.pages().iter().take(scan_count) {
+        if total_chars >= limits::MAX_PDF_TEXT_CHARS {
+            truncated_text = true;
+            break;
+        }
         let text = page
             .text()
             .map_err(|e| format!("Gagal membaca teks PDF: {e}"))?
             .all();
-        if !text.trim().is_empty() {
+        let remaining = limits::MAX_PDF_TEXT_CHARS - total_chars;
+        let (kept, cut) = limits::truncate_chars(&text, remaining);
+        total_chars += kept.chars().count();
+        if cut {
+            truncated_text = true;
+        }
+        if !kept.trim().is_empty() {
             pages_with_text += 1;
         }
     }
     let mut warnings = Vec::new();
     if pages_with_text == 0 {
         warnings.push("PDF tidak memiliki teks yang dapat diekstrak; kemungkinan besar hasil scan. OCR disarankan.".into());
-    } else if pages_with_text < page_count {
-        warnings.push(format!("PDF campuran: hanya {pages_with_text} dari {page_count} halaman memiliki teks yang dapat diekstrak; halaman lain mungkin scan."));
+    } else if pages_with_text < scan_count {
+        warnings.push(format!("PDF campuran: hanya {pages_with_text} dari {scan_count} halaman yang diperiksa memiliki teks yang dapat diekstrak; halaman lain mungkin scan."));
+    }
+    if truncated_pages {
+        warnings.push(format!(
+            "PDF memiliki {page_count} halaman; preflight hanya memeriksa {} halaman pertama.",
+            limits::MAX_PDF_PAGES
+        ));
+    }
+    if truncated_text {
+        warnings.push(format!(
+            "Teks PDF dipotong pada {} karakter saat preflight.",
+            limits::MAX_PDF_TEXT_CHARS
+        ));
     }
     Ok(warnings)
 }
@@ -406,22 +312,14 @@ fn cancel_conversion() {
 #[tauri::command]
 fn preflight_file(app: AppHandle, input: String) -> Result<PreflightReport, String> {
     let path = Path::new(&input);
-    let metadata = std::fs::metadata(path).map_err(|e| format!("Tidak dapat membaca file: {e}"))?;
-    if !metadata.is_file() {
-        return Err("Path bukan file biasa.".into());
-    }
+    let size = limits::check_input_size(path)?;
     let mut warnings = Vec::new();
-    if metadata.len() == 0 {
-        return Err("File kosong.".into());
-    }
-    if metadata.len() > 500 * 1024 * 1024 {
-        warnings.push(
-            "File lebih besar dari 500 MB; konversi bisa memerlukan waktu dan memori besar.".into(),
-        );
+    if let Some(warning) = limits::size_warning(size) {
+        warnings.push(warning);
     }
     let ext = path
         .extension()
-        .and_then(|e| e.to_str())
+        .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_lowercase();
     if ext == "pdf" {
@@ -432,12 +330,14 @@ fn preflight_file(app: AppHandle, input: String) -> Result<PreflightReport, Stri
         inspect_rtf(path)?;
     }
     Ok(PreflightReport {
-        size_bytes: metadata.len(),
+        size_bytes: size,
         warnings,
     })
 }
 
 fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String> {
+    use std::io::Read as _;
+
     let file =
         std::fs::File::open(path).map_err(|e| format!("Tidak dapat membuka dokumen: {e}"))?;
     let mut archive = zip::ZipArchive::new(file)
@@ -448,9 +348,9 @@ fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String>
         ));
     }
     let xml_names: Vec<String> = (0..archive.len())
-        .filter_map(|i| {
+        .filter_map(|index| {
             archive
-                .by_index(i)
+                .by_index(index)
                 .ok()
                 .map(|entry| entry.name().to_owned())
         })
@@ -466,6 +366,7 @@ fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String>
         return Err(format!("Arsip {ext} tidak memiliki dokumen XML utama."));
     }
     let mut referenced = std::collections::HashSet::new();
+    let mut total_bytes = 0u64;
     for name in xml_names {
         let entry = archive
             .by_name(&name)
@@ -476,7 +377,11 @@ fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String>
                 "XML dokumen terlalu besar untuk diperiksa dengan aman ({name})."
             ));
         }
-        let mut xml = String::with_capacity(entry.size() as usize);
+        total_bytes = total_bytes.saturating_add(entry.size());
+        if total_bytes > limits::MAX_XML_TOTAL_BYTES {
+            return Err("Total XML dokumen melewati batas ukuran aman.".into());
+        }
+        let mut xml = String::new();
         entry
             .take(MAX_XML_BYTES + 1)
             .read_to_string(&mut xml)
@@ -486,9 +391,9 @@ fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String>
         }
         for marker in ["w:rFonts", "typeface="] {
             let mut remaining = xml.as_str();
-            while let Some(pos) = remaining.find(marker) {
-                remaining = &remaining[pos + marker.len()..];
-                if let Some(start) = remaining.find(['\"', '\'']) {
+            while let Some(position) = remaining.find(marker) {
+                remaining = &remaining[position + marker.len()..];
+                if let Some(start) = remaining.find(['"', '\'']) {
                     let quote = remaining.as_bytes()[start] as char;
                     let value = &remaining[start + 1..];
                     if let Some(end) = value.find(quote) {
@@ -506,22 +411,21 @@ fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String>
         .into_iter()
         .filter(|font| !installed.contains(font))
         .collect();
-    let warnings = if missing.is_empty() {
-        Vec::new()
+    if missing.is_empty() {
+        Ok(Vec::new())
     } else {
-        vec![format!(
+        Ok(vec![format!(
             "Font mungkin tidak terpasang: {}. Nama font diekstrak dari metadata dokumen; hasil dapat berbeda jika font ter-embed atau alias digunakan.",
             missing.join(", ")
-        )]
-    };
-    Ok(warnings)
+        )])
+    }
 }
 
 fn installed_font_names() -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     if let Ok(entries) = std::fs::read_dir(r"C:\Windows\Fonts") {
         for entry in entries.flatten() {
-            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+            if let Some(stem) = entry.path().file_stem().and_then(|value| value.to_str()) {
                 names.insert(stem.to_lowercase());
             }
         }
@@ -549,8 +453,8 @@ fn installed_font_names() -> std::collections::HashSet<String> {
 }
 
 fn inspect_rtf(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("Tidak dapat membaca RTF: {e}"))?;
-    let sample = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+    let bytes = limits::read_prefix(path, limits::RTF_PREFIX_BYTES)?;
+    let sample = String::from_utf8_lossy(&bytes);
     if !sample.trim_start().starts_with("{\\rtf") {
         return Err("File berekstensi RTF tetapi header RTF tidak valid.".into());
     }
@@ -558,13 +462,15 @@ fn inspect_rtf(path: &Path) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn convert_file(input: String, target: String) -> Result<ConversionReport, String> {
+fn convert_file(app: AppHandle, input: String, target: String) -> Result<ConversionReport, String> {
     CANCEL_CONVERSION.store(false, Ordering::SeqCst);
     let started = Instant::now();
     let source = Path::new(&input);
     if !source.is_file() {
         return Err("File sumber tidak ditemukan.".into());
     }
+    limits::check_input_size(source)?;
+
     let target_key = target.to_lowercase();
     let target_ext = match target_key.as_str() {
         "searchable pdf" => "pdf",
@@ -580,7 +486,7 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
     };
     let ext = source
         .extension()
-        .and_then(|e| e.to_str())
+        .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_lowercase();
     let ocr_target = target_key == "searchable pdf" || target_key == "ocr text";
@@ -613,10 +519,12 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
         let gs = ghostscript_path().ok_or("Ghostscript tidak ditemukan.")?;
         let tess_dir = tesseract.parent().ok_or("Path Tesseract tidak valid.")?;
         let gs_dir = gs.parent().ok_or("Path Ghostscript tidak valid.")?;
-        let mut search_path = vec![tess_dir.to_path_buf(), gs_dir.to_path_buf()];
-        if let Some(path) = std::env::var_os("PATH") {
-            search_path.extend(std::env::split_paths(&path));
-        }
+        // Hanya direktori engine terverifikasi + System32. Tidak ada PATH user.
+        let search_path = vec![
+            tess_dir.to_path_buf(),
+            gs_dir.to_path_buf(),
+            engines::system32_dir(),
+        ];
         let joined = std::env::join_paths(search_path)
             .map_err(|e| format!("PATH engine tidak valid: {e}"))?;
         let (ocr_output, sidecar) = if target_key == "searchable pdf" {
@@ -627,36 +535,34 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
                 .tempdir()
                 .map_err(|e| format!("Gagal membuat direktori OCR sementara: {e}"))?;
             let temp_pdf = temp.path().join("searchable.pdf");
-            (temp_pdf, Some((temp, output.clone())))
+            (temp_pdf, Some(temp))
         };
-        let mut cmd = Command::new(ocr);
-        cmd.env("PATH", joined)
+        let mut command = Command::new(ocr);
+        command
+            .env("PATH", joined)
             .args(["--deskew", "--rotate-pages", "-l", "ind+eng"]);
         if target_key == "searchable pdf" {
-            cmd.arg("--skip-text");
+            command.arg("--skip-text");
         } else {
-            cmd.arg("--force-ocr");
+            command.arg("--force-ocr");
         }
-        if let Some((_, ref sidecar_path)) = sidecar {
-            cmd.arg("--sidecar").arg(sidecar_path);
+        if target_key == "ocr text" {
+            let sidecar_path = output.with_extension("txt");
+            command.arg("--sidecar").arg(&sidecar_path);
         }
-        cmd.arg(source).arg(&ocr_output);
-        let expected_output = sidecar
-            .as_ref()
-            .map(|(_, path)| path.as_path())
-            .unwrap_or(&output);
-        run_engine_for_output(&mut cmd, "OCRmyPDF / Tesseract", expected_output)?;
-        if let Some((temp, sidecar_path)) = sidecar {
-            if !sidecar_path.is_file() {
-                drop(temp);
-                return Err("OCR selesai tanpa menghasilkan file teks sidecar.".into());
-            }
-            drop(temp);
+        command.arg(source).arg(&ocr_output);
+        let expected_output = if target_key == "searchable pdf" {
+            output.as_path()
+        } else {
+            ocr_output.as_path()
+        };
+        run_engine_for_output(&mut command, "OCRmyPDF / Tesseract", expected_output)?;
+        if target_key == "ocr text" && !output.is_file() {
+            drop(sidecar);
+            return Err("OCR selesai tanpa menghasilkan file teks sidecar.".into());
         }
-        if !output.is_file() {
-            return Err("OCR selesai tanpa menghasilkan output.".into());
-        }
-        return Ok(ConversionReport {
+        drop(sidecar);
+        let report = ConversionReport {
             output: output.to_string_lossy().into_owned(),
             engine: "OCRmyPDF + Tesseract + Ghostscript".into(),
             tier: "B/C".into(),
@@ -667,8 +573,11 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
             } else {
                 "Akurasi OCR bergantung pada kualitas scan; lapisan teks yang sudah ada dipertahankan dengan --skip-text.".into()
             }),
-        });
+        };
+        record_history(&app, source, &report)?;
+        return Ok(report);
     }
+
     let office_input = ["docx", "doc", "odt", "rtf"].contains(&ext.as_str());
     let pandoc_input = [
         "md", "markdown", "html", "htm", "txt", "docx", "odt", "rtf", "epub", "tex",
@@ -706,19 +615,28 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
             "Rute konversi .{ext} ke {target} tidak didukung atau engine yang diperlukan tidak tersedia."
         ));
     }
+
     let (engine, tier, warning) = if pdf_input && target_ext == "docx" && pdf2docx_path().is_some()
     {
         let converter = pdf2docx_path().ok_or("pdf2docx tidak ditemukan.")?;
-        let mut cmd = Command::new(converter);
-        cmd.args(["convert"]).arg(source).arg("-d").arg(&output);
-        run_engine_for_output(&mut cmd, "pdf2docx", &output)?;
-        ("pdf2docx", "B", Some("PDF direkonstruksi menjadi elemen DOCX yang dapat diedit. Kemiripan bergantung pada struktur PDF; scan, layout kompleks, dan font khusus dapat memerlukan koreksi.".into()))
+        let mut command = Command::new(converter);
+        command.args(["convert"]).arg(source).arg("-d").arg(&output);
+        run_engine_for_output(&mut command, "pdf2docx", &output)?;
+        (
+            "pdf2docx",
+            "B",
+            Some("PDF direkonstruksi menjadi elemen DOCX yang dapat diedit. Kemiripan bergantung pada struktur PDF; scan, layout kompleks, dan font khusus dapat memerlukan koreksi.".into()),
+        )
     } else if target_ext == "md" {
         let anymd = anymd_path().ok_or("AnyMD tidak ditemukan.")?;
-        let mut cmd = Command::new(anymd);
-        cmd.args(["convert"]).arg(source).arg("-o").arg(&output);
-        run_engine_for_output(&mut cmd, "AnyMD", &output)?;
-        ("AnyMD", "B", Some("Markdown berfokus pada struktur dan teks; tata letak visual, sebagian tabel, dan elemen non-teks dapat berubah atau tidak ikut.".into()))
+        let mut command = Command::new(anymd);
+        command.args(["convert"]).arg(source).arg("-o").arg(&output);
+        run_engine_for_output(&mut command, "AnyMD", &output)?;
+        (
+            "AnyMD",
+            "B",
+            Some("Markdown berfokus pada struktur dan teks; tata letak visual, sebagian tabel, dan elemen non-teks dapat berubah atau tidak ikut.".into()),
+        )
     } else if pdf_input && target_ext == "docx" && anymd_path().is_some() && pandoc_path().is_some()
     {
         let anymd = anymd_path().ok_or("AnyMD tidak ditemukan.")?;
@@ -738,7 +656,11 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
         let mut build_docx = Command::new(pandoc);
         build_docx.arg(&markdown).arg("-o").arg(&output);
         run_engine_for_output(&mut build_docx, "Pandoc (Markdown to DOCX)", &output)?;
-        ("AnyMD + Pandoc", "B", Some("PDF diekstrak ke Markdown lalu direkonstruksi sebagai DOCX. Layout, tabel kompleks, gambar, dan scan mungkin tidak terjaga; OCR AnyMD opsional mungkin diperlukan untuk PDF scan.".into()))
+        (
+            "AnyMD + Pandoc",
+            "B",
+            Some("PDF diekstrak ke Markdown lalu direkonstruksi sebagai DOCX. Layout, tabel kompleks, gambar, dan scan mungkin tidak terjaga; OCR AnyMD opsional mungkin diperlukan untuk PDF scan.".into()),
+        )
     } else if target_ext == "pdf" && office_input {
         let lo = libreoffice_path().ok_or("LibreOffice tidak ditemukan.")?;
         let profile = tempfile::Builder::new()
@@ -753,44 +675,43 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
                 .replace('\\', "/")
                 .replace(' ', "%20")
         );
-        let mut cmd = Command::new(lo);
-        cmd.arg(format!("-env:UserInstallation={profile_url}"))
+        let mut command = Command::new(lo);
+        command
+            .arg(format!("-env:UserInstallation={profile_url}"))
             .args(["--headless", "--convert-to", "pdf", "--outdir"])
             .arg(output.parent().unwrap_or(Path::new(".")))
             .arg(source);
-        run_engine_for_output(&mut cmd, "LibreOffice", &output)?;
+        run_engine_for_output(&mut command, "LibreOffice", &output)?;
         (
             "LibreOffice",
             "A",
-            Some(
-                "Hasil bergantung pada font dan fitur dokumen yang didukung LibreOffice."
-                    .to_string(),
-            ),
+            Some("Hasil bergantung pada font dan fitur dokumen yang didukung LibreOffice.".into()),
         )
     } else if target_ext == "pdf" && pandoc_input {
         let pandoc = pandoc_path().ok_or("Pandoc tidak ditemukan.")?;
         if typst_path().is_none() {
             return Err("Typst tidak ditemukan; diperlukan untuk membuat PDF dari Pandoc.".into());
         }
-        let mut cmd = Command::new(pandoc);
-        cmd.arg(source)
+        let mut command = Command::new(pandoc);
+        command
+            .arg(source)
             .arg("-o")
             .arg(&output)
             .args(["--pdf-engine=typst"]);
-        run_engine_for_output(&mut cmd, "Pandoc + Typst", &output)?;
+        run_engine_for_output(&mut command, "Pandoc + Typst", &output)?;
         (
             "Pandoc + Typst",
             "B",
             Some(
                 "Layout dibangun ulang; hasil visual mungkin berbeda dari dokumen Office asal."
-                    .to_string(),
+                    .into(),
             ),
         )
     } else if target_ext != "pdf" && pandoc_input && !pdf_input && pandoc_output {
         let pandoc = pandoc_path().ok_or("Pandoc tidak ditemukan.")?;
-        let mut cmd = Command::new(pandoc);
-        cmd.arg(source).arg("-o").arg(&output);
-        run_engine_for_output(&mut cmd, "Pandoc", &output)?;
+        let mut command = Command::new(pandoc);
+        command.arg(source).arg("-o").arg(&output);
+        run_engine_for_output(&mut command, "Pandoc", &output)?;
         ("Pandoc", "B", None)
     } else if pdf_input {
         let lo = libreoffice_path().ok_or("LibreOffice tidak ditemukan.")?;
@@ -806,13 +727,18 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
                 .replace('\\', "/")
                 .replace(' ', "%20")
         );
-        let mut cmd = Command::new(lo);
-        cmd.arg(format!("-env:UserInstallation={profile_url}"))
+        let mut command = Command::new(lo);
+        command
+            .arg(format!("-env:UserInstallation={profile_url}"))
             .args(["--headless", "--convert-to", target_ext, "--outdir"])
             .arg(output.parent().unwrap_or(Path::new(".")))
             .arg(source);
-        run_engine_for_output(&mut cmd, "LibreOffice (PDF import)", &output)?;
-        ("LibreOffice (PDF import)", "C", Some("PDF adalah format visual; teks dan layout direkonstruksi, hasil bisa berubah signifikan. Scan memerlukan OCR.".to_string()))
+        run_engine_for_output(&mut command, "LibreOffice (PDF import)", &output)?;
+        (
+            "LibreOffice (PDF import)",
+            "C",
+            Some("PDF adalah format visual; teks dan layout direkonstruksi, hasil bisa berubah signifikan. Scan memerlukan OCR.".into()),
+        )
     } else if target_ext != "pdf" && office_input && office_output {
         let lo = libreoffice_path().ok_or("LibreOffice tidak ditemukan.")?;
         let profile = tempfile::Builder::new()
@@ -827,12 +753,13 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
                 .replace('\\', "/")
                 .replace(' ', "%20")
         );
-        let mut cmd = Command::new(lo);
-        cmd.arg(format!("-env:UserInstallation={profile_url}"))
+        let mut command = Command::new(lo);
+        command
+            .arg(format!("-env:UserInstallation={profile_url}"))
             .args(["--headless", "--convert-to", target_ext, "--outdir"])
             .arg(output.parent().unwrap_or(Path::new(".")))
             .arg(source);
-        run_engine_for_output(&mut cmd, "LibreOffice", &output)?;
+        run_engine_for_output(&mut command, "LibreOffice", &output)?;
         ("LibreOffice", "B", None)
     } else {
         return Err(format!(
@@ -842,13 +769,15 @@ fn convert_file(input: String, target: String) -> Result<ConversionReport, Strin
     if !output.is_file() {
         return Err("Engine selesai tanpa menghasilkan file keluaran.".into());
     }
-    Ok(ConversionReport {
+    let report = ConversionReport {
         output: output.to_string_lossy().into_owned(),
         engine: engine.into(),
         tier: tier.into(),
         duration_ms: started.elapsed().as_millis(),
         warning,
-    })
+    };
+    record_history(&app, source, &report)?;
+    Ok(report)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -861,7 +790,6 @@ pub fn run() {
             history_list,
             open_output,
             reveal_output,
-            history_add,
             history_clear,
             preflight_file,
             convert_file,

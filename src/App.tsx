@@ -2,57 +2,14 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { conversionTabs, extensionsForTab, targetsForTab } from "./lib/conversion";
+import type { ConversionTab, EngineStatus } from "./lib/conversion";
 import "./App.css";
 
-type ConversionTab = "office" | "markdown" | "pdf" | "other";
 type FileItem = { id: string; tab: ConversionTab; file: { name: string; size: number }; path: string; target: string; status: string; warnings?: string[] };
 type PreflightReport = { size_bytes: number; warnings: string[] };
-type EngineStatus = { pandoc: boolean; anymd: boolean; pdf2docx: boolean; libreoffice: boolean; typst: boolean; ocrmypdf: boolean; tesseract: boolean; ghostscript: boolean };
 type ConversionReport = { output: string; engine: string; tier: string; duration_ms: number; warning: string | null };
 type HistoryItem = { name: string; output: string; engine: string; tier: string; at: number };
-const pandocInputs = ["md", "markdown", "html", "htm", "txt", "tex", "epub", "docx", "odt", "rtf"];
-const loInputs = ["docx", "doc", "odt", "rtf", "pdf"];
-const conversionTabs: { id: ConversionTab; label: string; description: string }[] = [
-  { id: "office", label: "Office ↔ PDF", description: "Convert Word and Office documents to and from PDF." },
-  { id: "markdown", label: "Any → Markdown", description: "Extract document content into Markdown with AnyMD." },
-  { id: "pdf", label: "PDF tools", description: "Create searchable PDFs or extract OCR text." },
-  { id: "other", label: "Other formats", description: "Convert HTML, text, and other supported formats." },
-];
-function targetsForTab(fileName: string, engines: EngineStatus | null, tab: ConversionTab) {
-  const all = formatsFor(fileName, engines);
-  const ext = fileName.split(".").pop()?.toLowerCase() || "";
-  if (tab === "office") {
-    const officeInputs = ["doc", "docx", "odt", "rtf", "pdf"];
-    return officeInputs.includes(ext) ? all.filter((target) => target === "PDF" || (ext === "pdf" && target === "DOCX")) : [];
-  }
-  if (tab === "markdown") return all.filter((target) => target === "Markdown");
-  if (tab === "pdf") return all.filter((target) => ["Searchable PDF", "OCR Text"].includes(target));
-  return all.filter((target) => !["PDF", "DOCX", "Markdown", "Searchable PDF", "OCR Text"].includes(target));
-}
-function extensionsForTab(tab: ConversionTab) {
-  if (tab === "office") return ["doc", "docx", "odt", "rtf", "pdf"];
-  if (tab === "markdown") return ["pdf", "doc", "docx", "odt", "rtf", "md", "markdown", "html", "htm", "txt", "tex", "epub", "eml", "msg", "ipynb", "png", "jpg", "jpeg", "zip"];
-  if (tab === "pdf") return ["pdf"];
-  return ["md", "markdown", "html", "htm", "txt", "tex", "epub", "csv", "tsv", "json", "yaml", "yml", "toml", "xml", "xlsx", "xls", "pptx", "ods", "odp"];
-}
-function formatsFor(fileName: string, engines: EngineStatus | null) {
-  const ext = fileName.split(".").pop()?.toLowerCase() || "";
-  const choices = new Set<string>();
-  if (engines?.anymd) choices.add("Markdown");
-  if (ext === "pdf") {
-    if (engines?.pdf2docx) choices.add("DOCX");
-    if (engines?.ocrmypdf && engines.tesseract && engines.ghostscript) choices.add("Searchable PDF").add("OCR Text");
-    if (engines?.libreoffice) ["DOCX", "TXT", "HTML", "ODT", "RTF"].forEach((format) => choices.add(format));
-  } else {
-    if (engines?.pandoc && pandocInputs.includes(ext)) {
-      ["DOCX", "Markdown", "HTML", "TXT", "ODT", "RTF"].forEach((format) => choices.add(format));
-      if (engines.typst) choices.add("PDF");
-    }
-    if (engines?.libreoffice && loInputs.includes(ext)) ["PDF", "DOCX", "ODT", "RTF"].forEach((format) => choices.add(format));
-  }
-  const sameFormat: Record<string, string> = { md: "Markdown", markdown: "Markdown", html: "HTML", htm: "HTML", txt: "TXT", docx: "DOCX", odt: "ODT", rtf: "RTF", pdf: "PDF" };
-  return [...choices].filter((format) => format !== sameFormat[ext]);
-}
 
 function App() {
   const [view, setView] = useState<"convert" | "history">("convert");
@@ -140,11 +97,10 @@ function App() {
         try {
           const result = await invoke<ConversionReport>("convert_file", { input: item.path, target: item.target });
           setItems((old) => old.map((entry) => entry.id === item.id ? { ...entry, status: `Done · Tier ${result.tier} · ${result.engine} · ${(result.duration_ms / 1000).toFixed(1)}s · ${result.output}${result.warning ? ` · ${result.warning}` : ""}` } : entry));
-          const record = { name: item.file.name, output: result.output, engine: result.engine, tier: result.tier, at: Date.now() };
+          // Riwayat ditulis Rust saat konversi berhasil; frontend hanya memuat ulang.
           try {
-            await invoke("history_add", { item: record });
-            setHistory((old) => [record, ...old].slice(0, 100));
-          } catch (error) { console.error("Failed to save conversion history:", error); }
+            setHistory(await invoke<HistoryItem[]>("history_list"));
+          } catch (error) { console.error("Failed to reload conversion history:", error); }
         } catch (error) {
           setItems((old) => old.map((entry) => entry.id === item.id ? { ...entry, status: stopRequested.current ? "Cancelled" : String(error) } : entry));
           if (stopRequested.current) break;
