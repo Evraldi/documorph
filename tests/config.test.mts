@@ -62,3 +62,16 @@ test("frontend test and typecheck scripts exist", () => {
   assert.equal(scripts.test, 'node --test "tests/*.test.mts"');
   assert.equal(scripts.typecheck, "tsc --noEmit");
 });
+
+test("README documents explicit engine locations after PATH was removed", () => {
+  const readme = read("README.md");
+  for (const hint of [
+    "WinGet",
+    "npm global",
+    "PYTHON_SCRIPTS_PATH",
+    "--version",
+    "--help",
+  ]) {
+    assert.ok(readme.includes(hint), `README harus menyebut ${hint}`);
+  }
+});

@@ -17,6 +17,8 @@ use crate::process::{hide_console, kill_process_tree, read_bounded};
 
 const PROBE_TIMEOUT_SECS: u64 = 3;
 const MAX_PROBE_BYTES: usize = 64 * 1024;
+/// Batasi traversal direktori dikenal supaya startup tidak melambat.
+const MAX_SCAN_DIRS: usize = 512;
 
 #[derive(Default, Clone)]
 pub struct EnginePaths {
@@ -64,6 +66,87 @@ fn usable_path(path: &Path) -> Option<PathBuf> {
         return None;
     }
     std::fs::canonicalize(path).ok()
+}
+
+fn env_dir_candidate(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).and_then(|value| {
+        let path = PathBuf::from(value);
+        if path.is_relative() || !path.is_dir() {
+            return None;
+        }
+        std::fs::canonicalize(path).ok()
+    })
+}
+
+/// Cari nama file tertentu di bawah root yang dikenal, dengan batas kedalaman.
+/// Symlink dilewati supaya tidak ada loop atau escape keluar dari root.
+fn named_files_under(root: &Path, names: &[&str], max_depth: usize) -> Vec<PathBuf> {
+    use std::collections::VecDeque;
+
+    let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
+    let mut visited = 0usize;
+    let mut found = Vec::new();
+    while let Some((dir, depth)) = queue.pop_front() {
+        if visited >= MAX_SCAN_DIRS {
+            break;
+        }
+        visited += 1;
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_file() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if names
+                    .iter()
+                    .any(|wanted| name == wanted.to_ascii_lowercase())
+                    && let Some(canonical) = usable_path(&path)
+                {
+                    found.push(canonical);
+                }
+            } else if file_type.is_dir() && depth < max_depth {
+                queue.push_back((path, depth + 1));
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// WinGet menyimpan binary di `Packages/<package>/<versi>/<exe>`.
+fn winget_candidates(names: &[&str]) -> Vec<PathBuf> {
+    local_app_data()
+        .map(|root| named_files_under(&root.join(r"Microsoft\WinGet\Packages"), names, 3))
+        .unwrap_or_default()
+}
+
+/// npm global menyimpan shim `.cmd` di `%APPDATA%\npm` dan `node_modules`.
+fn npm_global_candidates(names: &[&str]) -> Vec<PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(|root| named_files_under(&PathBuf::from(root).join("npm"), names, 3))
+        .unwrap_or_default()
+}
+
+/// Python Scripts standar, plus direktori eksplisit untuk install portable.
+fn python_scripts_candidates(names: &[&str]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if let Some(ref local) = local_app_data() {
+        found.extend(named_files_under(&local.join(r"Programs\Python"), names, 3));
+    }
+    if let Some(dir) = env_dir_candidate("PYTHON_SCRIPTS_PATH") {
+        found.extend(names.iter().filter_map(|name| usable_path(&dir.join(name))));
+    }
+    found.sort();
+    found.dedup();
+    found
 }
 
 fn ghostscript_candidates() -> Vec<PathBuf> {
@@ -159,6 +242,8 @@ fn discover_all() -> EnginePaths {
         if let Some(ref local) = local {
             candidates.push(local.join(r"Programs\anymd-venv\Scripts\anymd.exe"));
         }
+        candidates.extend(winget_candidates(&["anymd.exe"]));
+        candidates.extend(npm_global_candidates(&["anymd.cmd", "anymd.exe"]));
         candidates
     };
     let anymd = locate(anymd_candidates, &["anymd "]);
@@ -174,6 +259,8 @@ fn discover_all() -> EnginePaths {
         if let Some(ref local) = local {
             candidates.push(local.join(r"Programs\anymd-venv\Scripts\pdf2docx.exe"));
         }
+        candidates.extend(npm_global_candidates(&["pdf2docx.cmd", "pdf2docx.exe"]));
+        candidates.extend(python_scripts_candidates(&["pdf2docx.exe"]));
         candidates
     };
     let pdf2docx = locate(pdf2docx_candidates, &["pdf2docx"]);
@@ -189,6 +276,7 @@ fn discover_all() -> EnginePaths {
         if let Some(ref local) = local {
             candidates.push(local.join(r"Pandoc\pandoc.exe"));
         }
+        candidates.extend(winget_candidates(&["pandoc.exe"]));
         candidates
     };
 
@@ -200,6 +288,7 @@ fn discover_all() -> EnginePaths {
         for root in program_files() {
             candidates.push(root.join(r"LibreOffice\program\soffice.exe"));
         }
+        candidates.extend(winget_candidates(&["soffice.exe"]));
         candidates
     };
 
@@ -212,6 +301,7 @@ fn discover_all() -> EnginePaths {
             candidates.push(local.join(r"Programs\Typst\typst.exe"));
             candidates.push(local.join(r"typst\bin\typst.exe"));
         }
+        candidates.extend(winget_candidates(&["typst.exe"]));
         candidates
     };
 
@@ -223,6 +313,8 @@ fn discover_all() -> EnginePaths {
         if let Some(ref local) = local {
             candidates.push(local.join(r"Programs\ocrmypdf-venv\Scripts\ocrmypdf.exe"));
         }
+        candidates.extend(python_scripts_candidates(&["ocrmypdf.exe"]));
+        candidates.extend(winget_candidates(&["ocrmypdf.exe"]));
         candidates
     };
 
@@ -234,6 +326,7 @@ fn discover_all() -> EnginePaths {
         for root in program_files() {
             candidates.push(root.join(r"Tesseract-OCR\tesseract.exe"));
         }
+        candidates.extend(winget_candidates(&["tesseract.exe"]));
         candidates
     };
 
@@ -243,6 +336,7 @@ fn discover_all() -> EnginePaths {
             candidates.push(path);
         }
         candidates.extend(ghostscript_candidates());
+        candidates.extend(winget_candidates(&["gswin64c.exe"]));
         candidates
     };
 
@@ -284,6 +378,18 @@ mod tests {
     }
 
     #[test]
+    fn npm_style_cmd_shims_are_discovered() {
+        let root = std::env::temp_dir().join(format!("documorph-npm-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(root.join("node_modules"));
+        let shim = root.join("anymd.cmd");
+        std::fs::write(&shim, b"@echo off").expect("write shim");
+        let found = named_files_under(&root, &["anymd.cmd"], 2);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("anymd.cmd"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn relative_candidates_are_rejected() {
         assert!(usable_path(Path::new(r"anymd.exe")).is_none());
     }
@@ -304,5 +410,20 @@ mod tests {
     fn env_value_helper_accepts_os_str() {
         let value: &OsStr = OsStr::new("");
         assert_eq!(env_candidate_from(value), None);
+    }
+
+    #[test]
+    fn named_files_under_respects_depth_and_names() {
+        let root = std::env::temp_dir().join(format!("documorph-scan-{}", std::process::id()));
+        let nested = root.join("pkg").join("v1");
+        let deeper = nested.join("extra");
+        std::fs::create_dir_all(&deeper).expect("create scan tree");
+        std::fs::write(nested.join("tool.exe"), b"x").expect("write tool");
+        std::fs::write(nested.join("other.exe"), b"x").expect("write other");
+        std::fs::write(deeper.join("tool.exe"), b"x").expect("write deep tool");
+        let found = named_files_under(&root, &["tool.exe"], 2);
+        assert_eq!(found.len(), 1, "hanya satu tool.exe dalam batas kedalaman");
+        assert!(found[0].ends_with("tool.exe"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

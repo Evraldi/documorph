@@ -619,7 +619,7 @@ fn convert_file(app: AppHandle, input: String, target: String) -> Result<Convers
     let (engine, tier, warning) = if pdf_input && target_ext == "docx" && pdf2docx_path().is_some()
     {
         let converter = pdf2docx_path().ok_or("pdf2docx tidak ditemukan.")?;
-        let mut command = Command::new(converter);
+        let mut command = Command::new(&converter);
         command.args(["convert"]).arg(source).arg("-d").arg(&output);
         run_engine_for_output(&mut command, "pdf2docx", &output)?;
         (
@@ -629,7 +629,7 @@ fn convert_file(app: AppHandle, input: String, target: String) -> Result<Convers
         )
     } else if target_ext == "md" {
         let anymd = anymd_path().ok_or("AnyMD tidak ditemukan.")?;
-        let mut command = Command::new(anymd);
+        let mut command = Command::new(&anymd);
         command.args(["convert"]).arg(source).arg("-o").arg(&output);
         run_engine_for_output(&mut command, "AnyMD", &output)?;
         (
@@ -646,7 +646,7 @@ fn convert_file(app: AppHandle, input: String, target: String) -> Result<Convers
             .tempdir()
             .map_err(|e| format!("Gagal membuat file sementara: {e}"))?;
         let markdown = temp.path().join("extracted.md");
-        let mut extract = Command::new(anymd);
+        let mut extract = Command::new(&anymd);
         extract
             .args(["convert"])
             .arg(source)

@@ -18,11 +18,15 @@ This template should help get you started developing with Tauri, React and Types
   (versi 159.0.8138.0). DLL dari path build-machine hanya dipakai di `debug`
   dan tetap diverifikasi hash-nya; rilis hanya memuat DLL dari resource bundle.
 - Lisensi pihak ketiga ikut ter-packaging di folder `licenses/`.
-- Engine eksternal **tidak dicari di PATH**. Tentukan eksplisit lewat env var
-  opsional `ANYMD_PATH`, `PDF2DOCX_PATH`, `PANDOC_PATH`, `LIBREOFFICE_PATH`,
-  `TYPST_PATH`, `OCRMYPDF_PATH`, `TESSERACT_PATH`, `GHOSTSCRIPT_PATH`, atau
-  install di lokasi Program Files / `%LOCALAPPDATA%` yang dikenal. Setiap
-  binary diverifikasi lewat `--version`/`--help` sebelum dipakai.
+- Engine eksternal **tidak dicari di PATH**. Kandidat yang diperiksa: env var
+  eksplisit (`ANYMD_PATH`, `PDF2DOCX_PATH`, `PANDOC_PATH`,
+  `LIBREOFFICE_PATH`, `TYPST_PATH`, `OCRMYPDF_PATH`, `TESSERACT_PATH`,
+  `GHOSTSCRIPT_PATH`), Program Files, `%LOCALAPPDATA%`, paket WinGet,
+  shim npm global di `%APPDATA%\npm`, dan `Python\Python*\Scripts` standar.
+  Install Python portable bisa ditunjuk lewat `PYTHON_SCRIPTS_PATH`. Shim
+  `.cmd` npm memakai `node.exe` dari PATH pengguna (keterbatasan shim npm),
+  tetapi binary engine tetap dipilih dari kandidat eksplisit dan diverifikasi
+  lewat `--version`/`--help` sebelum dipakai — bukan diambil dari PATH.
 - Batas aman preflight: input maksimal 500 MB, peringatan mulai 100 MB,
   RTF hanya dibaca 4 KB pertama, PDF maksimal 200 halaman / 200.000 karakter
   teks, dan total XML Office maksimal 64 MB.
