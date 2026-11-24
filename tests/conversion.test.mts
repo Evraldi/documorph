@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   extensionsForTab,
+  runnableQueue,
   targetsForTab,
 } from "../src/lib/conversion.ts";
 
@@ -54,4 +55,17 @@ test("Other formats offers real Pandoc targets, not an empty select", () => {
 
 test("A format without any backend route has no target", () => {
   assert.deepEqual(targetsForTab("data.csv", allEngines, "other"), []);
+});
+
+test("Queue excludes items without target or with failed preflight", () => {
+  const queue = [
+    { id: "ok", path: "C:\\in\\a.pdf", target: "DOCX", status: "Ready" },
+    { id: "no-target", path: "C:\\in\\b.csv", target: "", status: "No supported route / engine" },
+    { id: "failed", path: "C:\\in\\c.pdf", target: "DOCX", status: "Preflight failed: broken" },
+    { id: "picker", path: "", target: "PDF", status: "Run in the Tauri desktop app" },
+  ];
+  assert.deepEqual(
+    runnableQueue(queue).map((item) => item.id),
+    ["ok"],
+  );
 });

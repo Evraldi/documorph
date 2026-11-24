@@ -121,6 +121,20 @@ export function targetsForTab(
   return all.filter((target) => target !== "Markdown");
 }
 
+export type QueueItem = { path: string; target: string; status: string };
+
+/// Item tanpa target atau yang gagal preflight tidak dipanggil dan tidak
+/// dihitung dalam total progress.
+export function runnableQueue<T extends QueueItem>(items: T[]): T[] {
+  return items.filter(
+    (item) =>
+      Boolean(item.path) &&
+      Boolean(item.target) &&
+      !item.status.startsWith("Preflight failed") &&
+      item.status !== "No supported route / engine",
+  );
+}
+
 export function extensionsForTab(tab: ConversionTab): string[] {
   if (tab === "office") return ["doc", "docx", "odt", "rtf", "pdf"];
   if (tab === "markdown") {

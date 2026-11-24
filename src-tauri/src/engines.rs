@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{OnceLock, mpsc},
+    sync::{Mutex, MutexGuard, mpsc},
     thread,
     time::Duration,
 };
@@ -16,7 +16,9 @@ use wait_timeout::ChildExt;
 use crate::process::{hide_console, kill_process_tree, read_bounded};
 
 const PROBE_TIMEOUT_SECS: u64 = 3;
-const MAX_PROBE_BYTES: usize = 64 * 1024;
+/// Marker versi bisa muncul di stderr atau setelah banner panjang: baca
+/// kedua stream dan beri jendela yang lebih longgar dari 64 KB.
+const MAX_PROBE_BYTES: usize = 256 * 1024;
 /// Batasi traversal direktori dikenal supaya startup tidak melambat.
 const MAX_SCAN_DIRS: usize = 512;
 
@@ -32,10 +34,24 @@ pub struct EnginePaths {
     pub ghostscript: Option<PathBuf>,
 }
 
-static ENGINES: OnceLock<EnginePaths> = OnceLock::new();
+static ENGINES: Mutex<Option<EnginePaths>> = Mutex::new(None);
 
-pub fn engine_paths() -> &'static EnginePaths {
-    ENGINES.get_or_init(discover_all)
+fn registry() -> MutexGuard<'static, Option<EnginePaths>> {
+    ENGINES.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Kembalikan salinan agar cache bisa di-refresh tanpa mengunci frontend.
+pub fn engine_paths() -> EnginePaths {
+    let mut guard = registry();
+    if guard.is_none() {
+        *guard = Some(discover_all());
+    }
+    guard.as_ref().cloned().unwrap_or_default()
+}
+
+/// Hapus cache saat pengguna memperbaiki/menginstal engine tanpa restart.
+pub fn refresh() {
+    *registry() = None;
 }
 
 fn local_app_data() -> Option<PathBuf> {
@@ -180,14 +196,18 @@ fn probe(path: &Path, argument: &str) -> Option<String> {
     let mut command = Command::new(path);
     command
         .arg(argument)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     hide_console(&mut command);
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let _ = sender.send(read_bounded(stdout, MAX_PROBE_BYTES));
+        let mut bytes = read_bounded(stdout, MAX_PROBE_BYTES);
+        bytes.extend_from_slice(&read_bounded(stderr, MAX_PROBE_BYTES));
+        let _ = sender.send(bytes);
     });
 
     let status = match child.wait_timeout(Duration::from_secs(PROBE_TIMEOUT_SECS)) {
@@ -200,7 +220,7 @@ fn probe(path: &Path, argument: &str) -> Option<String> {
         }
     };
     let bytes = receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(2))
         .unwrap_or_default();
     if !status.success() {
         return None;

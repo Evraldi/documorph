@@ -75,3 +75,44 @@ test("README documents explicit engine locations after PATH was removed", () => 
     assert.ok(readme.includes(hint), `README harus menyebut ${hint}`);
   }
 });
+
+test("Toolchain and dependency versions are pinned", () => {
+  const pkg = json("package.json");
+  assert.equal(pkg.engines.node, ">=24.21.0");
+  assert.equal(pkg.engines.npm, ">=11.19.0");
+  assert.equal(pkg.devDependencies.vite, "8.3.6");
+  assert.equal(pkg.devDependencies.typescript, "6.0.3");
+  assert.equal(pkg.dependencies.react, "19.3.1");
+  assert.equal(pkg.scripts.audit, "npm audit --audit-level=high");
+  assert.match(read("src-tauri/Cargo.toml"), /rust-version\s*=\s*"1\.98\.1"/);
+  assert.equal(/panic\s*=\s*"abort"/.test(read("src-tauri/Cargo.toml")), false);
+});
+
+test("CI runs tests, lint, audit and installer build", () => {
+  const workflow = read(".github/workflows/ci.yml");
+  for (const step of [
+    "npm run typecheck",
+    "npm test",
+    "npm run audit",
+    "cargo fmt --check",
+    "cargo clippy --all-targets -- -D warnings",
+    "cargo test",
+    "cargo audit",
+    "npm run tauri build",
+  ]) {
+    assert.ok(workflow.includes(step), `CI harus menjalankan ${step}`);
+  }
+});
+
+test("README replaces the template with prerequisites and conversion matrix", () => {
+  const readme = read("README.md");
+  for (const hint of [
+    "Prasyarat",
+    "Matriks konversi",
+    "Build & test",
+    "Code signing",
+    "unsigned",
+  ]) {
+    assert.ok(readme.includes(hint), `README harus menyebut ${hint}`);
+  }
+});
