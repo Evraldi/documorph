@@ -29,8 +29,8 @@ sha2 = "0.10"
 
 serde = { version = "1", features = ["derive"] }
 pdfium-render = { version = "0.9.5", features = ["pdfium_latest", "thread_safe"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

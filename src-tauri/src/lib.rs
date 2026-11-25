@@ -429,7 +429,7 @@ fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String>
             archive
                 .by_index(index)
                 .ok()
-                .map(|entry| entry.name().to_owned())
+                .and_then(|entry| entry.name().ok().map(|name| name.into_owned()))
         })
         .filter(|name| {
             name.ends_with(".xml")

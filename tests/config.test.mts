@@ -7,6 +7,14 @@ import { test } from "node:test";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 const json = (path: string) => JSON.parse(read(path));
+const lockVersions = (name: string): string[] => {
+  const lock = read("src-tauri/Cargo.lock").replace(/\r\n/g, "\n");
+  const pattern = new RegExp(
+    `\\[\\[package\\]\\]\\nname = "${name}"\\nversion = "([^"]+)"`,
+    "g",
+  );
+  return [...lock.matchAll(pattern)].map((match) => match[1]);
+};
 
 test("production CSP and dev CSP are both configured", () => {
   const config = json("src-tauri/tauri.conf.json");
@@ -86,6 +94,36 @@ test("Toolchain and dependency versions are pinned", () => {
   assert.equal(pkg.scripts.audit, "npm audit --audit-level=high");
   assert.match(read("src-tauri/Cargo.toml"), /rust-version\s*=\s*"1\.98\.1"/);
   assert.equal(/panic\s*=\s*"abort"/.test(read("src-tauri/Cargo.toml")), false);
+});
+
+test("Rust lockfile stays above patched versions from 2026 advisories", () => {
+  const minimums: Record<string, string> = {
+    cookie: "0.18.3",
+    "libsqlite3-sys": "0.39.0",
+    url: "2.5.9",
+    zip: "9.0.0",
+  };
+  const atLeast = (version: string, minimum: string) => {
+    const left = version.split(".").map(Number);
+    const right = minimum.split(".").map(Number);
+    for (let i = 0; i < right.length; i += 1) {
+      if ((left[i] || 0) !== right[i]) return (left[i] || 0) > right[i];
+    }
+    return true;
+  };
+  for (const [name, minimum] of Object.entries(minimums)) {
+    const versions = lockVersions(name);
+    assert.ok(versions.length > 0, `${name} harus tercatat di Cargo.lock`);
+    for (const version of versions) {
+      assert.ok(
+        atLeast(version, minimum),
+        `${name} ${version} harus >= ${minimum}`,
+      );
+    }
+  }
+  const cargo = read("src-tauri/Cargo.toml");
+  assert.match(cargo, /^zip = \{ version = "9"/m);
+  assert.match(cargo, /^rusqlite = \{ version = "0\.41"/m);
 });
 
 test("CI runs tests, lint, audit and installer build", () => {

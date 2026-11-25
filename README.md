@@ -100,3 +100,6 @@ Kandidat diperiksa dari lokasi eksplisit (bukan PATH): env var per engine
 - Lisensi pihak ketiga ikut ter-packaging di folder `licenses/`.
 - `wix.upgradeCode` dan `webviewInstallMode` sudah dikonfigurasi; target bundle
   hanya `nsis` dan `msi`.
+- `cargo audit` dijalankan di CI. Lockfile menjaga `zip` ≥ 9, `cookie` ≥ 0.18.3,
+  `url` ≥ 2.5.9, dan `rusqlite` ≥ 0.41 (`libsqlite3-sys` ≥ 0.39 / SQLite 3.54.1)
+  sesuai advisory 2026; test config menolak regresi ke versi lama.
