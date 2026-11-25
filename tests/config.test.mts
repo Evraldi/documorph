@@ -251,6 +251,16 @@ test("engine stderr is redacted and Explorer opens are guarded", () => {
   assert.match(read("src/App.tsx"), /take_open_files/);
 });
 
+test("adding files is allowed while a conversion is running", () => {
+  const app = read("src/App.tsx");
+  assert.equal(
+    app.includes("if (busyRef.current) return;"),
+    false,
+    "addPaths tidak boleh diam-diam menolak file saat konversi berjalan",
+  );
+  assert.match(app, /freshPaths\(itemsRef\.current, acceptedPaths, tab\)/);
+});
+
 test("engine probing and conversion run off the UI thread", () => {
   const lib = read("src-tauri/src/lib.rs");
   for (const command of [

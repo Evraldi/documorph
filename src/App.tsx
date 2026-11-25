@@ -3,7 +3,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { conversionTabs, extensionsForTab, runnableQueue, targetsForTab } from "./lib/conversion";
+import {
+  conversionTabs,
+  extensionsForTab,
+  freshPaths,
+  runnableQueue,
+  targetsForTab,
+} from "./lib/conversion";
 import type { ConversionTab, EngineStatus } from "./lib/conversion";
 import "./App.css";
 
@@ -41,7 +47,8 @@ function App() {
   const [activeTab, setActiveTab] = useState<ConversionTab>("office");
   const activeTabRef = useRef<ConversionTab>("office");
   const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [items, setItems] = useState<FileItem[]>([]);
+  const [items, setItemsState] = useState<FileItem[]>([]);
+  const itemsRef = useRef<FileItem[]>([]);
   const [dragging, setDragging] = useState(false);
   const [engines, setEngines] = useState<EngineStatus | null>(null);
   const [notice, setNotice] = useState("");
@@ -53,6 +60,13 @@ function App() {
   const enginesRef = useRef<EngineStatus | null>(null);
   const enginesPromise = useRef<Promise<EngineStatus> | null>(null);
   const busyRef = useRef(false);
+  const setItems = (updater: (old: FileItem[]) => FileItem[]) => {
+    setItemsState((old) => {
+      const next = updater(old);
+      itemsRef.current = next;
+      return next;
+    });
+  };
   const unavailable: EngineStatus = {
     pandoc: false,
     anymd: false,
@@ -104,61 +118,55 @@ function App() {
   };
 
   const addPaths = async (paths: string[]) => {
-    if (busyRef.current) return;
     // Drop bisa terjadi sebelum engine_status selesai; tunggu dulu supaya
     // target tidak kosong dan status tidak perlu di-refresh manual.
+    const tab = activeTabRef.current;
     if (enginesPromise.current) await enginesPromise.current;
     let acceptedPaths: string[];
     try {
       acceptedPaths = await invoke<string[]>("filter_inputs", {
         paths,
-        extensions: extensionsForTab(activeTabRef.current),
+        extensions: extensionsForTab(tab),
       });
     } catch (error) {
       setNotice(`Filter input gagal: ${String(error)}`);
       return;
     }
-    if (!acceptedPaths.length) return;
-    setNotice(
-      acceptedPaths.length < paths.length
-        ? `${paths.length - acceptedPaths.length} file diabaikan (bukan file / ekstensi tidak didukung).`
-        : "",
-    );
+    const { accepted, duplicates } = freshPaths(itemsRef.current, acceptedPaths, tab);
+    const ignored = paths.length - acceptedPaths.length;
+    const notes = [
+      ignored ? `${ignored} file diabaikan (bukan file / ekstensi tidak didukung).` : "",
+      duplicates ? `${duplicates} file sudah ada di antrean tab ini.` : "",
+    ].filter(Boolean);
+    setNotice(notes.join(" "));
+    if (!accepted.length) return;
     setItems((old) => {
-      const existing = new Set(old.map((item) => item.path.toLowerCase()));
-      const additions = acceptedPaths
-        .filter((path) => {
-          const normalized = path.toLowerCase();
-          if (existing.has(normalized)) return false;
-          existing.add(normalized);
-          return true;
-        })
-        .map((path) => {
-          const name = path.split(/[\\/]/).pop() || path;
-          const tab = activeTabRef.current;
-          const targets = targetsForTab(name, enginesRef.current, tab);
-          return {
-            id: crypto.randomUUID(),
-            tab,
-            file: { name, size: 0 },
-            path,
-            target: targets.includes("Markdown")
-              ? "Markdown"
-              : targets.includes("PDF")
-                ? "PDF"
-                : targets[0] || "",
-            status: targets.length ? CHECKING : NO_ROUTE,
-            warnings: [] as string[],
-          };
-        });
+      const additions = freshPaths(old, accepted, tab).accepted.map((path) => {
+        const name = path.split(/[\\/]/).pop() || path;
+        const targets = targetsForTab(name, enginesRef.current, tab);
+        return {
+          id: crypto.randomUUID(),
+          tab,
+          file: { name, size: 0 },
+          path,
+          target: targets.includes("Markdown")
+            ? "Markdown"
+            : targets.includes("PDF")
+              ? "PDF"
+              : targets[0] || "",
+          status: targets.length ? CHECKING : NO_ROUTE,
+          warnings: [] as string[],
+        };
+      });
       return additions.length ? [...old, ...additions] : old;
     });
-    for (const path of acceptedPaths) {
+    for (const path of accepted) {
+      const matches = (item: FileItem) => item.tab === tab && item.path.toLowerCase() === path.toLowerCase();
       void invoke<PreflightReport>("preflight_file", { input: path })
         .then((report) => {
           setItems((old) =>
             old.map((item) =>
-              item.path.toLowerCase() === path.toLowerCase()
+              matches(item)
                 ? {
                     ...item,
                     file: { ...item.file, size: report.size_bytes },
@@ -172,9 +180,7 @@ function App() {
         .catch((error) => {
           setItems((old) =>
             old.map((item) =>
-              item.path.toLowerCase() === path.toLowerCase()
-                ? { ...item, status: `Preflight gagal: ${String(error)}` }
-                : item,
+              matches(item) ? { ...item, status: `Preflight gagal: ${String(error)}` } : item,
             ),
           );
         });

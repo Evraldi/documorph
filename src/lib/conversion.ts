@@ -122,6 +122,33 @@ export function targetsForTab(
 }
 
 export type QueueItem = { path: string; target: string; status: string };
+export type QueueEntry = { tab: ConversionTab; path: string };
+
+export function queueKey(tab: ConversionTab, path: string): string {
+  return `${tab}\u0000${path.toLowerCase()}`;
+}
+
+/// Antrean dipisah per tab: file yang sama boleh diproses di tab berbeda,
+/// tetapi tidak boleh dobel di tab yang sama.
+export function freshPaths<T extends QueueEntry>(
+  items: T[],
+  paths: string[],
+  tab: ConversionTab,
+): { accepted: string[]; duplicates: number } {
+  const seen = new Set(items.map((item) => queueKey(item.tab, item.path)));
+  const accepted: string[] = [];
+  let duplicates = 0;
+  for (const path of paths) {
+    const key = queueKey(tab, path);
+    if (seen.has(key)) {
+      duplicates += 1;
+      continue;
+    }
+    seen.add(key);
+    accepted.push(path);
+  }
+  return { accepted, duplicates };
+}
 
 /// Item tanpa target atau yang gagal preflight tidak dipanggil dan tidak
 /// dihitung dalam total progress.

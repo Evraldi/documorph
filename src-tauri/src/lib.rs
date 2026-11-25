@@ -27,6 +27,8 @@ struct OpenFiles(Mutex<Vec<String>>);
 const OPEN_EXTENSIONS: &[&str] = &[
     "pdf", "doc", "docx", "odt", "rtf", "md", "markdown", "html", "htm", "txt", "tex", "epub",
 ];
+/// Batasi peringatan supaya tidak membanjiri UI dengan font tema Office.
+const MAX_MISSING_FONTS: usize = 5;
 
 #[derive(Serialize)]
 struct EngineStatus {
@@ -425,6 +427,9 @@ fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String>
             "Arsip {ext} memiliki terlalu banyak entri untuk diperiksa dengan aman."
         ));
     }
+    // `word/theme` dan `fontTable` berisi daftar font untuk semua skrip Office,
+    // bukan font yang benar-benar dipakai di dokumen. Header/footer/footnote
+    // tetap diperiksa karena isinya bisa memakai font berbeda.
     let xml_names: Vec<String> = (0..archive.len())
         .filter_map(|index| {
             archive
@@ -432,13 +437,7 @@ fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String>
                 .ok()
                 .and_then(|entry| entry.name().ok().map(|name| name.into_owned()))
         })
-        .filter(|name| {
-            name.ends_with(".xml")
-                && (name == "word/document.xml"
-                    || name.starts_with("word/")
-                    || name == "content.xml"
-                    || name == "styles.xml")
-        })
+        .filter(|name| font_xml_name(name))
         .collect();
     if xml_names.is_empty() {
         return Err(format!("Arsip {ext} tidak memiliki dokumen XML utama."));
@@ -485,18 +484,43 @@ fn inspect_office_archive(path: &Path, ext: &str) -> Result<Vec<String>, String>
         }
     }
     let installed = installed_font_names();
-    let missing: Vec<_> = referenced
+    let mut missing: Vec<_> = referenced
         .into_iter()
-        .filter(|font| !installed.contains(font))
+        .filter(|font| !font_is_installed(font, &installed))
         .collect();
     if missing.is_empty() {
-        Ok(Vec::new())
-    } else {
-        Ok(vec![format!(
-            "Font mungkin tidak terpasang: {}. Nama font diekstrak dari metadata dokumen; hasil dapat berbeda jika font ter-embed atau alias digunakan.",
-            missing.join(", ")
-        )])
+        return Ok(Vec::new());
     }
+    missing.sort();
+    let shown = missing
+        .iter()
+        .take(MAX_MISSING_FONTS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let extra = missing.len().saturating_sub(MAX_MISSING_FONTS);
+    let suffix = if extra == 0 {
+        String::new()
+    } else {
+        format!(" (+{extra} lainnya)")
+    };
+    Ok(vec![format!(
+        "Font mungkin tidak terpasang: {}{suffix}. Nama font diekstrak dari teks dokumen; hasil dapat berbeda jika font ter-embed atau alias digunakan.",
+        shown.join(", ")
+    )])
+}
+
+/// XML yang benar-benar bisa memuat referensi font yang dipakai dokumen.
+fn font_xml_name(name: &str) -> bool {
+    if name == "content.xml" || name == "styles.xml" {
+        return true;
+    }
+    if !name.starts_with("word/") || !name.ends_with(".xml") {
+        return false;
+    }
+    !matches!(
+        name,
+        "word/fontTable.xml" | "word/settings.xml" | "word/webSettings.xml"
+    ) && !name.starts_with("word/theme/")
 }
 
 fn installed_font_names() -> std::collections::HashSet<String> {
@@ -512,7 +536,6 @@ fn installed_font_names() -> std::collections::HashSet<String> {
         "arial",
         "calibri",
         "cambria",
-        "times new roman",
         "courier new",
         "carlito",
         "caladea",
@@ -525,6 +548,23 @@ fn installed_font_names() -> std::collections::HashSet<String> {
         }
     }
     names
+}
+
+/// Nama font Word sering berbeda dari nama file font-nya, misalnya
+/// "Times New Roman" tersimpan sebagai `times.ttf`.
+fn font_is_installed(font: &str, installed: &std::collections::HashSet<String>) -> bool {
+    if installed.contains(font) {
+        return true;
+    }
+    let aliases: &[&str] = match font {
+        "times new roman" => &["times", "timesbd", "timesbi", "timesi"],
+        "courier" | "courier new" => &["cour", "courbd", "courbi", "couri"],
+        "calibri light" => &["calibril", "calibri"],
+        "cambria math" => &["cambriamath", "cambria"],
+        "ms gothic" | "ｍｓ ゴシック" => &["msgothic"],
+        _ => &[],
+    };
+    aliases.iter().any(|alias| installed.contains(*alias))
 }
 
 /// `{\rtf1` plus angka versi dan pemisah, bukan sekadar `{\rtf`.
@@ -1119,12 +1159,104 @@ mod tests {
     }
 
     #[test]
+    fn font_xml_scan_skips_theme_and_metadata_parts() {
+        assert!(font_xml_name("word/document.xml"));
+        assert!(font_xml_name("word/header1.xml"));
+        assert!(font_xml_name("word/glossary/document.xml"));
+        assert!(font_xml_name("content.xml"));
+        assert!(!font_xml_name("word/theme/theme1.xml"));
+        assert!(!font_xml_name("word/fontTable.xml"));
+        assert!(!font_xml_name("word/settings.xml"));
+        assert!(!font_xml_name("word/_rels/document.xml.rels"));
+    }
+
+    #[test]
     fn font_heuristic_rejects_paths_and_placeholders() {
         assert!(plausible_font("Times New Roman"));
         assert!(!plausible_font("auto"));
         assert!(!plausible_font("C:/Windows/Fonts/arial.ttf"));
         assert!(!plausible_font("http://example.com/font"));
         assert!(!plausible_font(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn office_font_warning_ignores_theme_fonts() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+
+        let dir = std::env::temp_dir().join(format!("documorph-font-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create font fixture dir");
+        let path = dir.join("sample.docx");
+        {
+            let file = std::fs::File::create(&path).expect("create docx");
+            let mut archive = zip::ZipWriter::new(file);
+            archive
+                .start_file("word/document.xml", SimpleFileOptions::default())
+                .expect("start document.xml");
+            archive
+                .write_all(
+                    br#"<w:document><w:rFonts w:ascii="Times New Roman"/><w:rFonts w:ascii="Documorph Body Font"/></w:document>"#,
+                )
+                .expect("write document.xml");
+            archive
+                .start_file("word/theme/theme1.xml", SimpleFileOptions::default())
+                .expect("start theme1.xml");
+            archive
+                .write_all(br#"<a:theme><a:latin typeface="Theme Exotic Font"/></a:theme>"#)
+                .expect("write theme1.xml");
+            archive
+                .start_file("word/header1.xml", SimpleFileOptions::default())
+                .expect("start header1.xml");
+            archive
+                .write_all(br#"<w:hdr><w:rFonts w:ascii="Documorph Header Font"/></w:hdr>"#)
+                .expect("write header1.xml");
+            archive.finish().expect("finish docx");
+        }
+
+        let warnings = inspect_office_archive(&path, "docx").expect("inspect docx");
+        assert_eq!(warnings.len(), 1);
+        let text = warnings[0].to_lowercase();
+        assert!(text.contains("documorph body font"));
+        assert!(text.contains("documorph header font"));
+        assert!(!text.contains("theme exotic font"));
+        assert!(
+            !text.contains("times new roman"),
+            "alias font tidak boleh dilaporkan"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn office_font_warning_caps_the_list() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+
+        let dir = std::env::temp_dir().join(format!("documorph-font-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create cap fixture dir");
+        let path = dir.join("many.docx");
+        {
+            let file = std::fs::File::create(&path).expect("create docx");
+            let mut archive = zip::ZipWriter::new(file);
+            archive
+                .start_file("word/document.xml", SimpleFileOptions::default())
+                .expect("start document.xml");
+            let fonts = ["a", "b", "c", "d", "e", "f", "g"]
+                .map(|name| format!("<w:rFonts w:ascii=\"Documorph Missing {name}\"/>"))
+                .join("");
+            archive
+                .write_all(format!("<w:document>{fonts}</w:document>").as_bytes())
+                .expect("write document.xml");
+            archive.finish().expect("finish docx");
+        }
+
+        let warnings = inspect_office_archive(&path, "docx").expect("inspect docx");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("(+2 lainnya)"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

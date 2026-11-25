@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   extensionsForTab,
+  freshPaths,
   runnableQueue,
   targetsForTab,
 } from "../src/lib/conversion.ts";
@@ -55,6 +56,19 @@ test("Other formats offers real Pandoc targets, not an empty select", () => {
 
 test("A format without any backend route has no target", () => {
   assert.deepEqual(targetsForTab("data.csv", allEngines, "other"), []);
+});
+
+test("A file is deduplicated per tab, not across tabs", () => {
+  const existing = [{ tab: "office" as const, path: "C:\\in\\skripsi.docx" }];
+
+  assert.deepEqual(
+    freshPaths(existing, ["c:\\IN\\skripsi.docx"], "office"),
+    { accepted: [], duplicates: 1 },
+  );
+  assert.deepEqual(
+    freshPaths(existing, ["C:\\IN\\skripsi.docx"], "markdown"),
+    { accepted: ["C:\\IN\\skripsi.docx"], duplicates: 0 },
+  );
 });
 
 test("Queue excludes items without target or with failed preflight", () => {
