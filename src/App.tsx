@@ -8,6 +8,8 @@ import {
   extensionsForTab,
   freshPaths,
   missingOcrEngines,
+  pdfDocxAvailable,
+  readyOcrEngines,
   runnableQueue,
   targetsForTab,
 } from "./lib/conversion";
@@ -391,6 +393,9 @@ function App() {
   };
 
   const activeLabel = conversionTabs.find((tab) => tab.id === activeTab);
+  const ocrMissing = engines ? missingOcrEngines(engines) : [];
+  const ocrSiap = engines ? readyOcrEngines(engines) : [];
+  const docxSiap = engines ? pdfDocxAvailable(engines) : false;
 
   return (
     <main className="app-shell">
@@ -574,18 +579,36 @@ function App() {
               <div className="engine-status">
                 {engines ? (
                   <>
-                    PDF→DOCX {engines.pdf2docx ? "✓" : "tidak ada"} <b>·</b> AnyMD{" "}
-                    {engines.anymd ? "✓" : "tidak ada"} <b>·</b> Pandoc{" "}
-                    {engines.pandoc ? "✓" : "tidak ada"} <b>·</b> LibreOffice{" "}
-                    {engines.libreoffice ? "✓" : "tidak ada"} <b>·</b> Typst{" "}
-                    {engines.typst ? "✓" : "tidak ada"} <b>·</b> OCR{" "}
-                    {engines.ocrmypdf && engines.tesseract && engines.ghostscript
-                      ? "siap"
-                      : "tidak ada"}
+                    <span className={docxSiap ? "ok" : "missing"}>
+                      PDF→DOCX {docxSiap ? "✓" : "tidak ada"}
+                    </span>
+                    <b>·</b>
+                    <span className={engines.anymd ? "ok" : "missing"}>
+                      AnyMD {engines.anymd ? "✓" : "tidak ada"}
+                    </span>
+                    <b>·</b>
+                    <span className={engines.pandoc ? "ok" : "missing"}>
+                      Pandoc {engines.pandoc ? "✓" : "tidak ada"}
+                    </span>
+                    <b>·</b>
+                    <span className={engines.libreoffice ? "ok" : "missing"}>
+                      LibreOffice {engines.libreoffice ? "✓" : "tidak ada"}
+                    </span>
+                    <b>·</b>
+                    <span className={engines.typst ? "ok" : "missing"}>
+                      Typst {engines.typst ? "✓" : "tidak ada"}
+                    </span>
+                    <b>·</b>
+                    <span className={ocrMissing.length ? "missing" : "ok"}>
+                      OCR{" "}
+                      {ocrMissing.length
+                        ? `${ocrMissing.join(" + ")} kurang`
+                        : "siap"}
+                    </span>
                   </>
                 ) : (
-                  "Memeriksa engine konversi…"
-                )}{" "}
+                  <span>Memeriksa engine konversi…</span>
+                )}
                 <button className="browse" disabled={busy} onClick={() => void refreshEngines()}>
                   Perbarui engine
                 </button>
@@ -594,17 +617,15 @@ function App() {
               <h2>{activeLabel?.label}</h2>
               <p>{activeLabel?.description}</p>
               {activeTab === "pdf" && engines && (
-                <p
-                  className={`engine-hint ${
-                    missingOcrEngines(engines).length ? "" : "ok"
-                  }`}
-                >
-                  {missingOcrEngines(engines).length
-                    ? `OCR belum siap: ${missingOcrEngines(engines).join(" + ")}.${
-                        targetsForTab("scan.pdf", engines, "pdf").includes("DOCX")
-                          ? " PDF → DOCX tetap tersedia."
+                <p className={`engine-hint ${ocrMissing.length ? "" : "ok"}`}>
+                  {ocrMissing.length
+                    ? `OCR belum siap: ${ocrMissing.join(" + ")}.${
+                        ocrSiap.length ? ` ${ocrSiap.join(" + ")} sudah ada.` : ""
+                      }${
+                        ocrMissing.includes("OCRmyPDF")
+                          ? " Set OCRMYPDF_PATH atau PYTHON_SCRIPTS_PATH lalu Perbarui engine."
                           : ""
-                      }`
+                      }${docxSiap ? " PDF → DOCX tetap tersedia." : ""}`
                     : "OCR siap. Tambah PDF untuk melihat Searchable PDF / OCR Text."}
                 </p>
               )}
@@ -704,20 +725,6 @@ function App() {
                                 Tier {result.tier} · {result.engine} ·{" "}
                                 {(result.duration_ms / 1000).toFixed(1)}s ·{" "}
                                 {result.output.split(/[\\/]/).pop()}
-                              </span>
-                              <span className="result-actions">
-                                <button
-                                  className="browse"
-                                  onClick={() => void tryOpenOutput(result.output)}
-                                >
-                                  Buka hasil
-                                </button>
-                                <button
-                                  className="browse"
-                                  onClick={() => void tryRevealOutput(result.output)}
-                                >
-                                  Folder
-                                </button>
                               </span>
                               {result.warning && (
                                 <span className="preflight-warning">⚠ {result.warning}</span>

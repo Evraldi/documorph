@@ -276,8 +276,19 @@ test("completed conversions are visible without reading a status line", () => {
   assert.match(app, /file berhasil dikonversi/);
   assert.match(app, /success-badge/);
   assert.match(app, /Buka hasil terakhir/);
+  assert.equal(app.includes('className="result-actions"'), false);
   assert.match(css, /\.success-badge\{/);
   assert.match(css, /\.file-row-done\{/);
+});
+
+test("engine status is centered and reports partial OCR readiness", () => {
+  const app = read("src/App.tsx");
+  const css = read("src/App.css");
+  assert.equal(css.includes("position:absolute;top:10px;right:14px"), false);
+  assert.match(css, /\.engine-status\{display:flex/);
+  assert.match(app, /ocrMissing\.join\(" \+ "\)/);
+  assert.match(app, /OCRMYPDF_PATH/);
+  assert.match(app, /PYTHON_SCRIPTS_PATH/);
 });
 
 test("Alat PDF exposes DOCX and explains missing OCR engines", () => {

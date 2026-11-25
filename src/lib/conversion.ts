@@ -198,11 +198,27 @@ export function extensionsForTab(tab: ConversionTab): string[] {
   return ["md", "markdown", "html", "htm", "txt", "tex", "epub"];
 }
 
+const OCR_ENGINES = [
+  { key: "ocrmypdf", label: "OCRmyPDF" },
+  { key: "tesseract", label: "Tesseract" },
+  { key: "ghostscript", label: "Ghostscript" },
+] as const satisfies readonly { key: keyof EngineStatus; label: string }[];
+
 /// Engine yang harus ada supaya opsi OCR di tab Alat PDF muncul.
 export function missingOcrEngines(engines: EngineStatus | null): string[] {
-  const missing: string[] = [];
-  if (!engines?.ocrmypdf) missing.push("OCRmyPDF");
-  if (!engines?.tesseract) missing.push("Tesseract");
-  if (!engines?.ghostscript) missing.push("Ghostscript");
-  return missing;
+  return OCR_ENGINES.filter(({ key }) => !engines?.[key]).map(({ label }) => label);
+}
+
+export function readyOcrEngines(engines: EngineStatus | null): string[] {
+  return OCR_ENGINES.filter(({ key }) => engines?.[key]).map(({ label }) => label);
+}
+
+/// PDF → DOCX punya tiga rute nyata di backend, bukan hanya pdf2docx.
+export function pdfDocxAvailable(engines: EngineStatus | null): boolean {
+  return Boolean(
+    engines &&
+      (engines.pdf2docx ||
+        (engines.anymd && engines.pandoc) ||
+        engines.libreoffice),
+  );
 }

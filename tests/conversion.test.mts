@@ -5,6 +5,8 @@ import {
   extensionsForTab,
   freshPaths,
   missingOcrEngines,
+  pdfDocxAvailable,
+  readyOcrEngines,
   runnableQueue,
   targetsForTab,
 } from "../src/lib/conversion.ts";
@@ -93,6 +95,25 @@ test("PDF tools offers DOCX even without OCR engines", () => {
     libreoffice: false,
   };
   assert.deepEqual(targetsForTab("scan.pdf", withoutDocxEngine, "pdf"), []);
+});
+
+test("OCR readiness separates the missing engine from installed ones", () => {
+  const partial = { ...allEngines, ocrmypdf: false };
+  assert.deepEqual(missingOcrEngines(partial), ["OCRmyPDF"]);
+  assert.deepEqual(readyOcrEngines(partial), ["Tesseract", "Ghostscript"]);
+  assert.equal(pdfDocxAvailable(partial), true);
+
+  assert.equal(pdfDocxAvailable(null), false);
+  assert.equal(
+    pdfDocxAvailable({
+      ...partial,
+      pdf2docx: false,
+      anymd: false,
+      pandoc: false,
+      libreoffice: false,
+    }),
+    false,
+  );
 });
 
 test("A format without any backend route has no target", () => {
