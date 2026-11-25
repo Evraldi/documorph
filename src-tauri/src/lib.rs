@@ -7,7 +7,7 @@ use std::{
     sync::Mutex,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
 
 mod db;
 mod engines;
@@ -18,6 +18,14 @@ mod pdfium_guard;
 mod process;
 
 static PDFIUM_INSTANCE: Mutex<Option<Result<Pdfium, String>>> = Mutex::new(None);
+
+/// Path yang dibuka dari Explorer ditampung sampai frontend siap mengambilnya.
+#[derive(Default)]
+struct OpenFiles(Mutex<Vec<String>>);
+
+const OPEN_EXTENSIONS: &[&str] = &[
+    "pdf", "doc", "docx", "odt", "rtf", "md", "markdown", "html", "htm", "txt", "tex", "epub",
+];
 
 #[derive(Serialize)]
 struct EngineStatus {
@@ -44,6 +52,7 @@ struct HistoryItem {
     engine: String,
     tier: String,
     at: i64,
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -90,11 +99,17 @@ fn history_connection(app: &AppHandle) -> Result<Connection, String> {
     db::open(&dir.join("history.sqlite3"))
 }
 
-fn insert_history_record(app: &AppHandle, item: &HistoryItem) -> Result<(), String> {
-    let conn = history_connection(app)?;
+fn insert_history_record(conn: &Connection, item: &HistoryItem) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO history (name, output, engine, tier, at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![item.name, item.output, item.engine, item.tier, item.at],
+        "INSERT INTO history (name, output, engine, tier, at, warnings) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            item.name,
+            item.output,
+            item.engine,
+            item.tier,
+            item.at,
+            db::encode_warnings(&item.warnings)
+        ],
     )
     .map_err(|e| format!("Gagal menyimpan riwayat: {e}"))?;
     conn.execute("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY at DESC, id DESC LIMIT 100)", [])
@@ -103,7 +118,12 @@ fn insert_history_record(app: &AppHandle, item: &HistoryItem) -> Result<(), Stri
 }
 
 /// Riwayat hanya boleh ditulis oleh `convert_file`, bukan oleh frontend.
-fn record_history(app: &AppHandle, source: &Path, report: &ConversionReport) -> Result<(), String> {
+fn record_history(
+    app: &AppHandle,
+    source: &Path,
+    report: &ConversionReport,
+    warnings: &[String],
+) -> Result<(), String> {
     let name = source
         .file_name()
         .and_then(|value| value.to_str())
@@ -114,13 +134,14 @@ fn record_history(app: &AppHandle, source: &Path, report: &ConversionReport) -> 
         .map_err(|e| e.to_string())?
         .as_millis() as i64;
     insert_history_record(
-        app,
+        &history_connection(app)?,
         &HistoryItem {
             name,
             output: report.output.clone(),
             engine: report.engine.clone(),
             tier: report.tier.clone(),
             at,
+            warnings: warnings.to_vec(),
         },
     )
 }
@@ -152,7 +173,7 @@ fn reveal_output(app: AppHandle, path: String) -> Result<(), String> {
     let output = PathBuf::from(&path);
     ensure_output_path(&app, &output)?;
     tauri_plugin_opener::reveal_item_in_dir(output)
-        .map_err(|e| format!("Could not reveal output: {e}"))
+        .map_err(|e| format!("Tidak dapat menampilkan folder keluaran: {e}"))
 }
 
 #[tauri::command]
@@ -160,13 +181,16 @@ fn open_output(app: AppHandle, path: String) -> Result<(), String> {
     let output = PathBuf::from(&path);
     ensure_output_path(&app, &output)?;
     tauri_plugin_opener::open_path(output.to_string_lossy().into_owned(), None::<&str>)
-        .map_err(|e| format!("Could not open output: {e}"))
+        .map_err(|e| format!("Tidak dapat membuka keluaran: {e}"))
 }
 
 #[tauri::command]
 fn history_list(app: AppHandle) -> Result<Vec<HistoryItem>, String> {
-    let conn = history_connection(&app)?;
-    let mut statement = conn.prepare("SELECT name, output, engine, tier, at FROM history ORDER BY at DESC, id DESC LIMIT 100")
+    list_history(&history_connection(&app)?)
+}
+
+fn list_history(conn: &Connection) -> Result<Vec<HistoryItem>, String> {
+    let mut statement = conn.prepare("SELECT name, output, engine, tier, at, warnings FROM history ORDER BY at DESC, id DESC LIMIT 100")
         .map_err(|e| e.to_string())?;
     statement
         .query_map([], |row| {
@@ -176,6 +200,7 @@ fn history_list(app: AppHandle) -> Result<Vec<HistoryItem>, String> {
                 engine: row.get(2)?,
                 tier: row.get(3)?,
                 at: row.get(4)?,
+                warnings: db::decode_warnings(&row.get::<_, String>(5)?),
             })
         })
         .map_err(|e| e.to_string())?
@@ -357,7 +382,13 @@ fn filter_inputs(paths: Vec<String>, extensions: Vec<String>) -> Vec<String> {
 
 #[tauri::command]
 fn preflight_file(app: AppHandle, input: String) -> Result<PreflightReport, String> {
-    let path = Path::new(&input);
+    inspect_input(&app, &input)
+}
+
+/// Dipakai preflight UI dan konversi supaya warning yang sama ikut tersimpan
+/// di riwayat.
+fn inspect_input(app: &AppHandle, input: &str) -> Result<PreflightReport, String> {
+    let path = Path::new(input);
     let size = limits::check_input_size(path)?;
     let mut warnings = Vec::new();
     if let Some(warning) = limits::size_warning(size) {
@@ -369,7 +400,7 @@ fn preflight_file(app: AppHandle, input: String) -> Result<PreflightReport, Stri
         .unwrap_or("")
         .to_lowercase();
     if ext == "pdf" {
-        warnings.extend(inspect_pdf(&app, path)?);
+        warnings.extend(inspect_pdf(app, path)?);
     } else if ["docx", "odt"].contains(&ext.as_str()) {
         warnings.extend(inspect_office_archive(path, &ext)?);
     } else if ext == "rtf" {
@@ -617,6 +648,9 @@ fn convert_file(
         return Err("File sumber tidak ditemukan.".into());
     }
     limits::check_input_size(source)?;
+    let warnings = inspect_input(&app, &input)
+        .map(|report| report.warnings)
+        .unwrap_or_default();
 
     let target_key = target.to_lowercase();
     let target_ext = match target_key.as_str() {
@@ -724,7 +758,7 @@ fn convert_file(
                 "Akurasi OCR bergantung pada kualitas scan; lapisan teks yang sudah ada dipertahankan dengan --skip-text.".into()
             }),
         };
-        record_history(&app, source, &report)?;
+        record_history(&app, source, &report, &warnings)?;
         return Ok(report);
     }
 
@@ -980,7 +1014,7 @@ fn convert_file(
         duration_ms: started.elapsed().as_millis(),
         warning,
     };
-    record_history(&app, source, &report)?;
+    record_history(&app, source, &report, &warnings)?;
     Ok(report)
 }
 
@@ -1006,15 +1040,50 @@ fn report_startup_error(error: &str) {
     }
 }
 
+/// File Association / Explorer hanya boleh menyuntik file dokumen yang memang
+/// didukung, bukan exe/dll atau direktori.
+fn openable_path(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| OPEN_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+fn file_arguments() -> Vec<String> {
+    std::env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .filter(|path| openable_path(path))
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+#[tauri::command]
+fn take_open_files(state: State<'_, OpenFiles>) -> Vec<String> {
+    state
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .drain(..)
+        .collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            app.manage(OpenFiles(Mutex::new(file_arguments())));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             engine_status,
             refresh_dependencies,
             filter_inputs,
+            take_open_files,
             history_list,
             open_output,
             reveal_output,
@@ -1074,6 +1143,44 @@ mod tests {
             vec!["pdf".into()],
         );
         assert_eq!(result, vec![allowed.to_string_lossy().into_owned()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_round_trips_preflight_warnings() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        db::migrate(&conn).expect("migrate");
+        insert_history_record(
+            &conn,
+            &HistoryItem {
+                name: "laporan.pdf".into(),
+                output: "C:\\Out\\laporan.docx".into(),
+                engine: "Pandoc".into(),
+                tier: "B".into(),
+                at: 1234,
+                warnings: vec!["PDF berisi teks kecil".into(), "Font tidak standar".into()],
+            },
+        )
+        .expect("insert");
+        let records = list_history(&conn).expect("list");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].warnings,
+            vec!["PDF berisi teks kecil", "Font tidak standar"]
+        );
+    }
+
+    #[test]
+    fn explorer_arguments_accept_only_supported_documents() {
+        let dir = std::env::temp_dir().join(format!("documorph-open-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let pdf = dir.join("laporan.pdf");
+        let exe = dir.join("payload.exe");
+        std::fs::write(&pdf, b"pdf").expect("pdf");
+        std::fs::write(&exe, b"exe").expect("exe");
+        assert!(openable_path(&pdf));
+        assert!(!openable_path(&exe));
+        assert!(!openable_path(&dir));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

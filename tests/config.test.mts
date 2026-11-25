@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -115,4 +115,100 @@ test("README replaces the template with prerequisites and conversion matrix", ()
   ]) {
     assert.ok(readme.includes(hint), `README harus menyebut ${hint}`);
   }
+});
+
+test("app metadata contains no template placeholders", () => {
+  const pkg = json("package.json");
+  assert.equal(pkg.name, "documorph");
+  assert.equal(pkg.description, "Konversi dokumen offline untuk Windows");
+  assert.equal(pkg.license, "UNLICENSED");
+  assert.equal(json("src-tauri/tauri.conf.json").productName, "documorph");
+  const cargo = read("src-tauri/Cargo.toml");
+  assert.match(cargo, /^description = "Konversi dokumen offline untuk Windows"$/m);
+  assert.match(cargo, /^authors = \["Evraldi"\]$/m);
+  const html = read("index.html");
+  assert.match(html, /<title>documorph<\/title>/);
+  assert.match(html, /<html lang="id">/);
+  assert.equal(/Tauri \+ React|vite\.svg|react\.svg/.test(html), false);
+});
+
+test("UI reads the version from Tauri instead of hardcoding it", () => {
+  const app = read("src/App.tsx");
+  assert.match(app, /getVersion\(\)/);
+  assert.equal(/v0\.1\.0/.test(app), false);
+  assert.equal(
+    json("src-tauri/tauri.conf.json").version,
+    json("package.json").version,
+  );
+});
+
+test("vite config no longer suppresses a missing type error", () => {
+  assert.equal(read("vite.config.ts").includes("@ts-expect-error"), false);
+  assert.equal(json("package.json").devDependencies["@types/node"], "26.6.7");
+});
+
+test("dead template dependencies and assets are removed", () => {
+  const cargo = read("src-tauri/Cargo.toml");
+  for (const dependency of ["serde_json", "quick-xml", "which"]) {
+    assert.equal(
+      new RegExp(`^${dependency}\\s*=`, "m").test(cargo),
+      false,
+      `${dependency} tidak boleh dipertahankan`,
+    );
+  }
+  for (const asset of [
+    "public/tauri.svg",
+    "public/vite.svg",
+    "src/assets/react.svg",
+    "src-tauri/include/fpdfview.h.orig",
+  ]) {
+    assert.equal(existsSync(join(root, asset)), false, `${asset} harus dihapus`);
+  }
+  assert.ok(existsSync(join(root, "public/app-icon.svg")));
+});
+
+test("UI strings are Indonesian and history deletion is confirmed", () => {
+  const sources = ["src/App.tsx", "src/lib/conversion.ts"].map(read).join("\n");
+  assert.equal(sources.includes("window.alert"), false);
+  assert.match(read("src/App.tsx"), /confirmClear/);
+  for (const english of [
+    "No supported route / engine",
+    "Clear history",
+    "Preflight failed",
+    "Ready",
+  ]) {
+    assert.equal(
+      sources.includes(english),
+      false,
+      `Masih ada UI Inggris: ${english}`,
+    );
+  }
+  assert.match(sources, /Tidak ada rute\/engine yang didukung/);
+  assert.match(sources, /Preflight gagal/);
+});
+
+test("history schema and query persist preflight warnings", () => {
+  const db = read("src-tauri/src/db.rs");
+  const lib = read("src-tauri/src/lib.rs");
+  assert.match(db, /ADD COLUMN warnings/);
+  assert.match(lib, /warnings: db::decode_warnings/);
+  assert.match(lib, /SELECT name, output, engine, tier, at, warnings/);
+  assert.match(lib, /record_history\(&app, source, &report, &warnings\)/);
+});
+
+test("engine stderr is redacted and Explorer opens are guarded", () => {
+  const process = read("src-tauri/src/process.rs");
+  assert.match(process, /fn redact_paths/);
+  assert.match(process, /redact_paths\(&raw\)/);
+  const config = json("src-tauri/tauri.conf.json");
+  assert.ok(
+    config.bundle.fileAssociations.some((entry: { ext: string[] }) =>
+      entry.ext.includes("pdf"),
+    ),
+  );
+  const lib = read("src-tauri/src/lib.rs");
+  assert.match(lib, /fn openable_path/);
+  assert.match(lib, /fn take_open_files/);
+  assert.match(lib, /take_open_files,/);
+  assert.match(read("src/App.tsx"), /take_open_files/);
 });

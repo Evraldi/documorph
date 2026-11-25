@@ -137,10 +137,34 @@ pub fn run_engine(command: &mut Command, name: &str, cancel: &AtomicBool) -> Res
     }
 }
 
-/// Ringkas stderr mentah: satu baris, terpotong, tanpa path yang berlebihan.
+/// Ganti token yang tampak seperti path absolut dengan placeholder. Stderr
+/// engine bisa menyebut folder internal mesin/user; itu tidak boleh bocor ke UI.
+pub fn redact_paths(text: &str) -> String {
+    text.split_whitespace()
+        .map(|token| {
+            let value = token.trim_matches(|ch| matches!(ch, '"' | '\'' | ',' | ';'));
+            let bytes = value.as_bytes();
+            let drive = bytes.len() > 2
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/');
+            let unc = value.starts_with(r"\\") || value.starts_with("//");
+            let rooted = value.starts_with('/') && value.matches('/').count() > 1;
+            if drive || unc || rooted {
+                "<path>".to_owned()
+            } else {
+                token.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Ringkas stderr mentah: satu baris, terpotong, tanpa path internal.
 pub fn sanitize_error(name: &str, stderr: &[u8]) -> String {
-    let text = String::from_utf8_lossy(stderr);
-    let (trimmed, truncated) = truncate_chars(text.trim(), ERROR_CHARS);
+    let raw = String::from_utf8_lossy(stderr);
+    let redacted = redact_paths(&raw);
+    let (trimmed, truncated) = truncate_chars(redacted.trim(), ERROR_CHARS);
     let flat = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.is_empty() {
         return format!("{name} gagal: proses keluar dengan status gagal.");
@@ -172,5 +196,15 @@ mod tests {
         let message = sanitize_error("Pandoc", long.as_bytes());
         assert!(message.ends_with(" …"));
         assert!(message.len() < ERROR_CHARS + 100);
+    }
+
+    #[test]
+    fn sanitize_error_hides_internal_paths() {
+        let message = sanitize_error(
+            "Pandoc",
+            b"cannot open C:\\Users\\Evraldi\\secret\\input.docx: error",
+        );
+        assert_eq!(message, "Pandoc gagal: cannot open <path> error");
+        assert!(!message.contains("Evraldi"));
     }
 }

@@ -34,22 +34,22 @@ export const conversionTabs: {
   {
     id: "office",
     label: "Office ↔ PDF",
-    description: "Convert Word and Office documents to and from PDF.",
+    description: "Konversi dokumen Word/Office ke dan dari PDF.",
   },
   {
     id: "markdown",
     label: "Any → Markdown",
-    description: "Extract document content into Markdown with AnyMD.",
+    description: "Ekstrak isi dokumen ke Markdown dengan AnyMD.",
   },
   {
     id: "pdf",
-    label: "PDF tools",
-    description: "Create searchable PDFs or extract OCR text.",
+    label: "Alat PDF",
+    description: "Buat PDF yang dapat dicari atau ekstrak teks OCR.",
   },
   {
     id: "other",
-    label: "Other formats",
-    description: "Convert Pandoc-supported text and markup formats.",
+    label: "Format lain",
+    description: "Konversi format teks/markup yang didukung Pandoc.",
   },
 ];
 
@@ -117,7 +117,7 @@ export function targetsForTab(
       ["Searchable PDF", "OCR Text"].includes(target),
     );
   }
-  // Markdown punya tab sendiri; "Other formats" hanya menawarkan rute Pandoc.
+  // Markdown punya tab sendiri; "Format lain" hanya menawarkan rute Pandoc.
   return all.filter((target) => target !== "Markdown");
 }
 
@@ -130,8 +130,8 @@ export function runnableQueue<T extends QueueItem>(items: T[]): T[] {
     (item) =>
       Boolean(item.path) &&
       Boolean(item.target) &&
-      !item.status.startsWith("Preflight failed") &&
-      item.status !== "No supported route / engine",
+      !item.status.startsWith("Preflight gagal") &&
+      item.status !== "Tidak ada rute/engine yang didukung",
   );
 }
 

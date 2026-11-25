@@ -40,9 +40,9 @@ divalidasi ulang di backend sebelum proses dijalankan.
 | Office ↔ PDF | PDF | DOCX | pdf2docx → (fallback AnyMD + Pandoc) | B |
 | Office ↔ PDF | PDF | DOCX/TXT/HTML/ODT/RTF | LibreOffice (PDF import) | C |
 | Any → Markdown | PDF, Office, Markdown, HTML, TXT, EPUB, TeX, dll. | Markdown | AnyMD | B |
-| PDF tools | PDF | Searchable PDF / OCR Text | OCRmyPDF + Tesseract + Ghostscript | B/C |
-| Other formats | Markdown/HTML/TXT/TeX/EPUB/DOCX/ODT/RTF | DOCX/Markdown/HTML/TXT/ODT/RTF | Pandoc | B |
-| Other formats | Markdown/HTML/TXT/TeX/EPUB | PDF | Pandoc + Typst | B |
+| Alat PDF | PDF | Searchable PDF / OCR Text | OCRmyPDF + Tesseract + Ghostscript | B/C |
+| Format lain | Markdown/HTML/TXT/TeX/EPUB/DOCX/ODT/RTF | DOCX/Markdown/HTML/TXT/ODT/RTF | Pandoc | B |
+| Format lain | Markdown/HTML/TXT/TeX/EPUB | PDF | Pandoc + Typst | B |
 
 Tier A/B/C adalah indikasi risiko perubahan layout; laporan per konversi
 menjelaskan keterbatasan rute yang dipilih.
@@ -59,9 +59,13 @@ Kandidat diperiksa dari lokasi eksplisit (bukan PATH): env var per engine
 - Shim `.cmd` npm memakai `node.exe` dari PATH pengguna (keterbatasan shim npm),
   tetapi binary engine tetap dipilih dari kandidat eksplisit dan diverifikasi
   lewat `--version`/`--help` sebelum dipakai.
-- Tombol **Refresh engines** memindai ulang tanpa restart aplikasi.
-- Klik **Open output** / **Show in folder** hanya menerima path hasil konversi
-  yang masih tercatat di riwayat lokal dan berekstensi keluaran yang dikenal.
+- Tombol **Perbarui engine** memindai ulang tanpa restart aplikasi.
+- Klik **Buka hasil** / **Tampilkan di folder** hanya menerima path hasil
+  konversi yang masih tercatat di riwayat lokal dan berekstensi keluaran yang
+  dikenal.
+- Installer mendaftarkan asosiasi `.pdf`; membuka PDF dari Explorer lewat
+  **Open with → documorph** akan memasukkan file ke antrean. Argumen dari
+  Explorer difilter ke ekstensi dokumen yang dikenal (exe/dll/direktori ditolak).
 
 ## Batas aman & perilaku
 
@@ -71,10 +75,16 @@ Kandidat diperiksa dari lokasi eksplisit (bukan PATH): env var per engine
 - File keluaran dibuat di folder data aplikasi (`output/job-*`), bukan di
   sebelah file input, sehingga tidak ada penimpaan file milik user.
 - Cancel per job: membatalkan satu konversi tidak membatalkan job lain; tombol
-  **Cancel queue** menghentikan semua job aktif.
+  **Batalkan antrean** menghentikan semua job aktif.
 - Drag-drop difilter di backend: direktori dan ekstensi yang tidak diterima tab
   ditolak sebelum masuk antrean.
-- Riwayat disimpan di SQLite WAL dengan `user_version`/migrasi skema.
+- Riwayat disimpan di SQLite WAL dengan `user_version`/migrasi skema. Warning
+  preflight ikut tersimpan dan ditampilkan kembali di tab **Riwayat**.
+- Seluruh UI berbahasa Indonesia; nomor versi dibaca dari metadata Tauri
+  (bukan hardcode) dan disamakan dengan `package.json` / `tauri.conf.json`.
+- Pesan error engine dibersihkan: satu baris, terpotong, path internal disamarkan
+  sebelum ditampilkan di UI.
+- Tombol **Hapus riwayat** butuh konfirmasi klik kedua; tidak ada `window.alert`.
 
 ## Catatan produksi
 

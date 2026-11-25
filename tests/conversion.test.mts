@@ -59,10 +59,25 @@ test("A format without any backend route has no target", () => {
 
 test("Queue excludes items without target or with failed preflight", () => {
   const queue = [
-    { id: "ok", path: "C:\\in\\a.pdf", target: "DOCX", status: "Ready" },
-    { id: "no-target", path: "C:\\in\\b.csv", target: "", status: "No supported route / engine" },
-    { id: "failed", path: "C:\\in\\c.pdf", target: "DOCX", status: "Preflight failed: broken" },
-    { id: "picker", path: "", target: "PDF", status: "Run in the Tauri desktop app" },
+    { id: "ok", path: "C:\\in\\a.pdf", target: "DOCX", status: "Siap" },
+    {
+      id: "no-target",
+      path: "C:\\in\\b.csv",
+      target: "",
+      status: "Tidak ada rute/engine yang didukung",
+    },
+    {
+      id: "failed",
+      path: "C:\\in\\c.pdf",
+      target: "DOCX",
+      status: "Preflight gagal: rusak",
+    },
+    {
+      id: "picker",
+      path: "",
+      target: "PDF",
+      status: "Gunakan Pilih file untuk memilih file ini",
+    },
   ];
   assert.deepEqual(
     runnableQueue(queue).map((item) => item.id),
