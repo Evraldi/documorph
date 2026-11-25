@@ -44,7 +44,7 @@ export const conversionTabs: {
   {
     id: "pdf",
     label: "Alat PDF",
-    description: "Buat PDF yang dapat dicari atau ekstrak teks OCR.",
+    description: "PDF → DOCX, buat PDF yang dapat dicari, atau ekstrak teks OCR.",
   },
   {
     id: "other",
@@ -61,7 +61,13 @@ export function formatsFor(
   const choices = new Set<string>();
   if (engines?.anymd) choices.add("Markdown");
   if (ext === "pdf") {
-    if (engines?.pdf2docx) choices.add("DOCX");
+    if (
+      engines?.pdf2docx ||
+      (engines?.anymd && engines.pandoc) ||
+      engines?.libreoffice
+    ) {
+      choices.add("DOCX");
+    }
     if (engines?.ocrmypdf && engines.tesseract && engines.ghostscript) {
       choices.add("Searchable PDF").add("OCR Text");
     }
@@ -113,8 +119,9 @@ export function targetsForTab(
   }
   if (tab === "markdown") return all.filter((target) => target === "Markdown");
   if (tab === "pdf") {
+    // PDF → DOCX juga alat PDF, bukan hanya Office. OCR butuh tiga engine.
     return all.filter((target) =>
-      ["Searchable PDF", "OCR Text"].includes(target),
+      ["DOCX", "Searchable PDF", "OCR Text"].includes(target),
     );
   }
   // Markdown punya tab sendiri; "Format lain" hanya menawarkan rute Pandoc.
@@ -189,4 +196,13 @@ export function extensionsForTab(tab: ConversionTab): string[] {
   }
   if (tab === "pdf") return ["pdf"];
   return ["md", "markdown", "html", "htm", "txt", "tex", "epub"];
+}
+
+/// Engine yang harus ada supaya opsi OCR di tab Alat PDF muncul.
+export function missingOcrEngines(engines: EngineStatus | null): string[] {
+  const missing: string[] = [];
+  if (!engines?.ocrmypdf) missing.push("OCRmyPDF");
+  if (!engines?.tesseract) missing.push("Tesseract");
+  if (!engines?.ghostscript) missing.push("Ghostscript");
+  return missing;
 }

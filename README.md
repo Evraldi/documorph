@@ -37,15 +37,19 @@ divalidasi ulang di backend sebelum proses dijalankan.
 | Tab | Input | Output | Engine | Tier |
 | --- | --- | --- | --- | --- |
 | Office ↔ PDF | DOC/DOCX/ODT/RTF | PDF | LibreOffice | A |
-| Office ↔ PDF | PDF | DOCX | pdf2docx → (fallback AnyMD + Pandoc) | B |
-| Office ↔ PDF | PDF | DOCX/TXT/HTML/ODT/RTF | LibreOffice (PDF import) | C |
+| Office ↔ PDF | PDF | DOCX | pdf2docx → AnyMD + Pandoc → LibreOffice Draw+Writer | B/C |
+| Office ↔ PDF | PDF | TXT/ODT/RTF | LibreOffice Draw → Writer | C |
+| Office ↔ PDF | PDF | HTML | LibreOffice Draw | C |
 | Any → Markdown | PDF, Office, Markdown, HTML, TXT, EPUB, TeX, dll. | Markdown | AnyMD | B |
+| Alat PDF | PDF | DOCX | pdf2docx → AnyMD + Pandoc → LibreOffice Draw+Writer | B/C |
 | Alat PDF | PDF | Searchable PDF / OCR Text | OCRmyPDF + Tesseract + Ghostscript | B/C |
 | Format lain | Markdown/HTML/TXT/TeX/EPUB/DOCX/ODT/RTF | DOCX/Markdown/HTML/TXT/ODT/RTF | Pandoc | B |
 | Format lain | Markdown/HTML/TXT/TeX/EPUB | PDF | Pandoc + Typst | B |
 
 Tier A/B/C adalah indikasi risiko perubahan layout; laporan per konversi
-menjelaskan keterbatasan rute yang dipilih.
+menjelaskan keterbatasan rute yang dipilih. LibreOffice tidak bisa mengekspor
+PDF langsung ke DOCX/ODT/TXT/RTF, jadi rute cadangannya mengimpor PDF sebagai
+HTML lewat Draw lalu membukanya di Writer dengan filter eksplisit.
 
 ## Deteksi engine
 

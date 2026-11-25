@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   extensionsForTab,
   freshPaths,
+  missingOcrEngines,
   runnableQueue,
   targetsForTab,
 } from "../src/lib/conversion.ts";
@@ -52,6 +53,46 @@ test("Other formats offers real Pandoc targets, not an empty select", () => {
   assert.equal(targets.includes("Markdown"), false);
   assert.ok(targets.includes("DOCX"));
   assert.ok(targets.includes("TXT"));
+});
+
+test("PDF tools offers DOCX even without OCR engines", () => {
+  assert.deepEqual(targetsForTab("scan.pdf", allEngines, "pdf"), [
+    "DOCX",
+    "Searchable PDF",
+    "OCR Text",
+  ]);
+
+  const noOcr = {
+    ...allEngines,
+    ocrmypdf: false,
+    tesseract: false,
+    ghostscript: false,
+  };
+  assert.deepEqual(targetsForTab("scan.pdf", noOcr, "pdf"), ["DOCX"]);
+  assert.deepEqual(missingOcrEngines(noOcr), [
+    "OCRmyPDF",
+    "Tesseract",
+    "Ghostscript",
+  ]);
+
+  const writerOnly = { ...noOcr, pdf2docx: false, anymd: false, pandoc: false };
+  assert.deepEqual(targetsForTab("scan.pdf", writerOnly, "pdf"), ["DOCX"]);
+
+  const markdownPipeline = {
+    ...noOcr,
+    pdf2docx: false,
+    libreoffice: false,
+  };
+  assert.deepEqual(targetsForTab("scan.pdf", markdownPipeline, "pdf"), ["DOCX"]);
+
+  const withoutDocxEngine = {
+    ...noOcr,
+    pdf2docx: false,
+    anymd: false,
+    pandoc: false,
+    libreoffice: false,
+  };
+  assert.deepEqual(targetsForTab("scan.pdf", withoutDocxEngine, "pdf"), []);
 });
 
 test("A format without any backend route has no target", () => {

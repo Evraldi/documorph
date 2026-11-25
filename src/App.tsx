@@ -7,6 +7,7 @@ import {
   conversionTabs,
   extensionsForTab,
   freshPaths,
+  missingOcrEngines,
   runnableQueue,
   targetsForTab,
 } from "./lib/conversion";
@@ -20,6 +21,7 @@ type FileItem = {
   path: string;
   target: string;
   status: string;
+  result?: ConversionReport;
   warnings?: string[];
 };
 type PreflightReport = { size_bytes: number; warnings: string[] };
@@ -38,6 +40,10 @@ type HistoryItem = {
   at: number;
   warnings: string[];
 };
+type Completion = {
+  count: number;
+  outputs: { name: string; path: string }[];
+};
 
 const NO_ROUTE = "Tidak ada rute/engine yang didukung";
 const CHECKING = "Memeriksa file…";
@@ -55,6 +61,7 @@ function App() {
   const [version, setVersion] = useState("");
   const [confirmClear, setConfirmClear] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [completion, setCompletion] = useState<Completion | null>(null);
   const [progress, setProgress] = useState({ current: 0, total: 0, id: "", name: "" });
   const stopRequested = useRef(false);
   const enginesRef = useRef<EngineStatus | null>(null);
@@ -118,6 +125,7 @@ function App() {
   };
 
   const addPaths = async (paths: string[]) => {
+    setCompletion(null);
     // Drop bisa terjadi sebelum engine_status selesai; tunggu dulu supaya
     // target tidak kosong dan status tidak perlu di-refresh manual.
     const tab = activeTabRef.current;
@@ -264,6 +272,8 @@ function App() {
     stopRequested.current = false;
     busyRef.current = true;
     setBusy(true);
+    setCompletion(null);
+    const successes: Completion["outputs"] = [];
     const work = runnableQueue(queue);
     setProgress({ current: 0, total: work.length, id: "", name: "" });
     try {
@@ -286,7 +296,9 @@ function App() {
         setProgress({ current, total: work.length, id: item.id, name: item.file.name });
         setItems((old) =>
           old.map((entry) =>
-            entry.id === item.id ? { ...entry, status: "Memulai konversi…" } : entry,
+            entry.id === item.id
+              ? { ...entry, status: "Memulai konversi…", result: undefined }
+              : entry,
           ),
         );
         try {
@@ -295,13 +307,11 @@ function App() {
             target: item.target,
             jobId: item.id,
           });
+          successes.push({ name: item.file.name, path: result.output });
           setItems((old) =>
             old.map((entry) =>
               entry.id === item.id
-                ? {
-                    ...entry,
-                    status: `Selesai · Tier ${result.tier} · ${result.engine} · ${(result.duration_ms / 1000).toFixed(1)}s · ${result.output}${result.warning ? ` · ${result.warning}` : ""}`,
-                  }
+                ? { ...entry, status: "Selesai", result }
                 : entry,
             ),
           );
@@ -313,6 +323,7 @@ function App() {
                 ? {
                     ...entry,
                     status: stopRequested.current ? "Dibatalkan" : `Gagal · ${String(error)}`,
+                    result: undefined,
                   }
                 : entry,
             ),
@@ -328,6 +339,9 @@ function App() {
               : entry,
           ),
         );
+      }
+      if (successes.length) {
+        setCompletion({ count: successes.length, outputs: successes });
       }
     } finally {
       busyRef.current = false;
@@ -350,16 +364,11 @@ function App() {
       setNotice(`Gagal menampilkan folder keluaran: ${String(error)}`);
     }
   };
-  const clearHistory = async () => {
-    if (!confirmClear) {
-      setConfirmClear(true);
-      setNotice("Klik sekali lagi untuk menghapus seluruh riwayat.");
-      return;
-    }
+  const confirmClearHistory = async () => {
+    setConfirmClear(false);
     try {
       await invoke("history_clear");
       setHistory([]);
-      setConfirmClear(false);
       setNotice("Riwayat dihapus.");
     } catch (error) {
       setNotice(`Gagal menghapus riwayat: ${String(error)}`);
@@ -431,6 +440,35 @@ function App() {
           </div>
           <div className="privacy-pill">⌑ &nbsp; File tetap di perangkat ini</div>
         </header>
+        {completion && !busy && (
+          <div className="success-panel" role="status">
+            <span className="success-icon">✓</span>
+            <div>
+              <strong>
+                Selesai · {completion.count} file berhasil dikonversi
+              </strong>
+              <span>
+                {completion.outputs.map((entry) => entry.name).join(", ")}
+              </span>
+            </div>
+            <button
+              className="browse"
+              onClick={() => void tryOpenOutput(completion.outputs[0].path)}
+            >
+              Buka hasil terakhir
+            </button>
+            <button className="clear" onClick={() => setView("history")}>
+              Lihat riwayat
+            </button>
+            <button
+              className="clear"
+              aria-label="Tutup notifikasi keberhasilan"
+              onClick={() => setCompletion(null)}
+            >
+              ×
+            </button>
+          </div>
+        )}
         {view === "history" ? (
           <>
             <div className="section-heading">
@@ -441,8 +479,8 @@ function App() {
                 <p>Tersimpan lokal di perangkat ini.</p>
               </div>
               {history.length > 0 && (
-                <button className="clear" onClick={() => void clearHistory()}>
-                  {confirmClear ? "Yakin hapus?" : "Hapus riwayat"}
+                <button className="clear danger" onClick={() => setConfirmClear(true)}>
+                  Hapus riwayat
                 </button>
               )}
             </div>
@@ -479,6 +517,37 @@ function App() {
                 <span>◷</span>
                 <strong>Belum ada konversi</strong>
                 <p>Konversi yang berhasil akan muncul di sini.</p>
+              </div>
+            )}
+            {confirmClear && (
+              <div
+                className="modal-backdrop"
+                onMouseDown={(event) => {
+                  if (event.target === event.currentTarget) setConfirmClear(false);
+                }}
+              >
+                <div
+                  className="confirm-dialog"
+                  role="alertdialog"
+                  aria-modal="true"
+                  aria-labelledby="confirm-clear-title"
+                  aria-describedby="confirm-clear-desc"
+                >
+                  <span className="confirm-icon">!</span>
+                  <h3 id="confirm-clear-title">Hapus seluruh riwayat?</h3>
+                  <p id="confirm-clear-desc">
+                    Riwayat konversi di aplikasi akan dihapus. File hasil di folder
+                    keluaran tidak ikut terhapus.
+                  </p>
+                  <div className="confirm-actions">
+                    <button className="browse" autoFocus onClick={() => setConfirmClear(false)}>
+                      Batal
+                    </button>
+                    <button className="danger-button" onClick={() => void confirmClearHistory()}>
+                      Ya, hapus riwayat
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
           </>
@@ -524,6 +593,21 @@ function App() {
               <div className="upload-icon">↑</div>
               <h2>{activeLabel?.label}</h2>
               <p>{activeLabel?.description}</p>
+              {activeTab === "pdf" && engines && (
+                <p
+                  className={`engine-hint ${
+                    missingOcrEngines(engines).length ? "" : "ok"
+                  }`}
+                >
+                  {missingOcrEngines(engines).length
+                    ? `OCR belum siap: ${missingOcrEngines(engines).join(" + ")}.${
+                        targetsForTab("scan.pdf", engines, "pdf").includes("DOCX")
+                          ? " PDF → DOCX tetap tersedia."
+                          : ""
+                      }`
+                    : "OCR siap. Tambah PDF untuk melihat Searchable PDF / OCR Text."}
+                </p>
+              )}
               <p>
                 atau{" "}
                 <button
@@ -596,55 +680,95 @@ function App() {
             )}
             {visibleItems.length ? (
               <div className="queue">
-                {visibleItems.map((item) => (
-                  <article className="file-row" key={item.id}>
-                    <div className="file-icon">
-                      {item.file.name.split(".").pop()?.toUpperCase().slice(0, 4)}
-                    </div>
-                    <div className="file-info">
-                      <strong>{item.file.name}</strong>
-                      <span>
-                        {item.file.size ? `${(item.file.size / 1024).toFixed(0)} KB` : "File lokal"}{" "}
-                        <b>·</b> {item.status}
-                        {busy && progress.id === item.id && item.status.startsWith("Memulai") && (
-                          <span className="stage-note">Konversi berjalan…</span>
-                        )}
-                        {item.warnings?.map((warning) => (
-                          <span className="preflight-warning" key={warning}>
-                            ⚠ {warning}
-                          </span>
+                {visibleItems.map((item) => {
+                  const targets = targetsForTab(item.file.name, engines, activeTab);
+                  const ocrMissing = activeTab === "pdf" ? missingOcrEngines(engines) : [];
+                  const result = item.result;
+                  return (
+                    <article
+                      className={`file-row ${result ? "file-row-done" : ""}`}
+                      key={item.id}
+                    >
+                      <div className="file-icon">
+                        {item.file.name.split(".").pop()?.toUpperCase().slice(0, 4)}
+                      </div>
+                      <div className="file-info">
+                        <strong>{item.file.name}</strong>
+                        <span>
+                          {item.file.size ? `${(item.file.size / 1024).toFixed(0)} KB` : "File lokal"}{" "}
+                          <b>·</b> {item.status}
+                          {result && (
+                            <>
+                              <span className="success-badge">✓ Selesai</span>
+                              <span className="result-detail">
+                                Tier {result.tier} · {result.engine} ·{" "}
+                                {(result.duration_ms / 1000).toFixed(1)}s ·{" "}
+                                {result.output.split(/[\\/]/).pop()}
+                              </span>
+                              <span className="result-actions">
+                                <button
+                                  className="browse"
+                                  onClick={() => void tryOpenOutput(result.output)}
+                                >
+                                  Buka hasil
+                                </button>
+                                <button
+                                  className="browse"
+                                  onClick={() => void tryRevealOutput(result.output)}
+                                >
+                                  Folder
+                                </button>
+                              </span>
+                              {result.warning && (
+                                <span className="preflight-warning">⚠ {result.warning}</span>
+                              )}
+                            </>
+                          )}
+                          {!targets.length && (
+                            <span className="route-note">
+                              {!engines
+                                ? "Memeriksa engine…"
+                                : ocrMissing.length
+                                  ? `Alat PDF butuh ${ocrMissing.join(" + ")}.`
+                                  : "Engine untuk rute ini belum tersedia."}
+                            </span>
+                          )}
+                          {busy && progress.id === item.id && item.status.startsWith("Memulai") && (
+                            <span className="stage-note">Konversi berjalan…</span>
+                          )}
+                          {item.warnings?.map((warning) => (
+                            <span className="preflight-warning" key={warning}>
+                              ⚠ {warning}
+                            </span>
+                          ))}
+                        </span>
+                      </div>
+                      <span className="arrow">→</span>
+                      <select
+                        value={targets.includes(item.target) ? item.target : targets[0] || ""}
+                        disabled={!targets.length || busy}
+                        onChange={(event) => update(item.id, { target: event.target.value })}
+                      >
+                        {targets.map((format) => (
+                          <option key={format}>{format}</option>
                         ))}
-                      </span>
-                    </div>
-                    <span className="arrow">→</span>
-                    <select
-                      value={
-                        targetsForTab(item.file.name, engines, activeTab).includes(item.target)
-                          ? item.target
-                          : targetsForTab(item.file.name, engines, activeTab)[0] || ""
-                      }
-                      disabled={!targetsForTab(item.file.name, engines, activeTab).length || busy}
-                      onChange={(event) => update(item.id, { target: event.target.value })}
-                    >
-                      {targetsForTab(item.file.name, engines, activeTab).map((format) => (
-                        <option key={format}>{format}</option>
-                      ))}
-                    </select>
-                    {busy && progress.id === item.id && (
-                      <button className="clear" onClick={() => void cancelJob(item.id)}>
-                        Batal
+                      </select>
+                      {busy && progress.id === item.id && (
+                        <button className="clear" onClick={() => void cancelJob(item.id)}>
+                          Batal
+                        </button>
+                      )}
+                      <button
+                        className="remove"
+                        aria-label="Hapus file"
+                        disabled={busy}
+                        onClick={() => setItems((old) => old.filter((entry) => entry.id !== item.id))}
+                      >
+                        ×
                       </button>
-                    )}
-                    <button
-                      className="remove"
-                      aria-label="Hapus file"
-                      disabled={busy}
-                      onClick={() => setItems((old) => old.filter((entry) => entry.id !== item.id))}
-                    >
-                      ×
-                    </button>
-                  </article>
-                ))}
+                    </article>
+                  );
+                })}
               </div>
             ) : (
               <div className="empty">

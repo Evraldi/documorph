@@ -261,6 +261,46 @@ test("adding files is allowed while a conversion is running", () => {
   assert.match(app, /freshPaths\(itemsRef\.current, acceptedPaths, tab\)/);
 });
 
+test("history deletion uses a real confirmation dialog", () => {
+  const app = read("src/App.tsx");
+  assert.equal(app.includes("Yakin hapus?"), false);
+  assert.match(app, /role="alertdialog"/);
+  assert.match(app, /Ya, hapus riwayat/);
+  assert.match(app, /confirm-clear-desc/);
+});
+
+test("completed conversions are visible without reading a status line", () => {
+  const app = read("src/App.tsx");
+  const css = read("src/App.css");
+  assert.match(app, /success-panel/);
+  assert.match(app, /file berhasil dikonversi/);
+  assert.match(app, /success-badge/);
+  assert.match(app, /Buka hasil terakhir/);
+  assert.match(css, /\.success-badge\{/);
+  assert.match(css, /\.file-row-done\{/);
+});
+
+test("Alat PDF exposes DOCX and explains missing OCR engines", () => {
+  const conversion = read("src/lib/conversion.ts");
+  const app = read("src/App.tsx");
+  const readme = read("README.md");
+  assert.match(conversion, /\["DOCX", "Searchable PDF", "OCR Text"\]/);
+  assert.match(conversion, /function missingOcrEngines/);
+  assert.match(app, /OCR belum siap:/);
+  assert.match(app, /Alat PDF butuh/);
+  assert.match(readme, /\| Alat PDF \| PDF \| DOCX \|/);
+});
+
+test("PDF to Writer documents uses real engine routes", () => {
+  const lib = read("src-tauri/src/lib.rs");
+  const readme = read("README.md");
+  assert.match(lib, /fn pdf2docx_convert_args/);
+  assert.equal(lib.includes('arg("-d").arg(&output)'), false);
+  assert.match(lib, /fn pdf_writer_route/);
+  assert.match(lib, /--infilter=HTML \(StarWriter\)/);
+  assert.match(readme, /LibreOffice Draw → Writer/);
+});
+
 test("engine probing and conversion run off the UI thread", () => {
   const lib = read("src-tauri/src/lib.rs");
   for (const command of [

@@ -631,6 +631,32 @@ fn anymd_convert_args(source: &Path, output: &Path) -> [OsString; 3] {
     ]
 }
 
+/// pdf2docx punya subcommand `convert`; output adalah argumen posisional kedua.
+/// Memakai `-d` membuat CLI mengira output adalah opsi yang tidak dikenal.
+fn pdf2docx_convert_args(source: &Path, output: &Path) -> [OsString; 3] {
+    [
+        OsString::from("convert"),
+        source.as_os_str().to_os_string(),
+        output.as_os_str().to_os_string(),
+    ]
+}
+
+/// Format yang hanya bisa dicapai dari PDF lewat LibreOffice Draw -> Writer.
+fn pdf_writer_route(target_ext: &str) -> bool {
+    ["docx", "txt", "odt", "rtf"].contains(&target_ext)
+}
+
+/// Profile unik mencegah dua job LibreOffice berebut instance yang sama.
+fn libreoffice_profile_url(profile: &Path) -> String {
+    format!(
+        "file:///{}",
+        profile
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace(' ', "%20")
+    )
+}
+
 /// Keluaran dibuat di folder data aplikasi dengan direktori unik per job.
 /// Tidak ada lagi penulisan di sebelah input yang bisa menimpa file milik user.
 fn staged_output(
@@ -830,8 +856,14 @@ fn convert_file(
     } else if pdf_input && target_ext == "docx" && anymd_path().is_some() && pandoc_path().is_some()
     {
         true
+    } else if pdf_input && pdf_writer_route(target_ext) {
+        // LibreOffice tidak bisa mengekspor PDF langsung ke DOCX/ODT/TXT/RTF.
+        // Rutenya: PDF -> HTML (Draw) -> format Writer dengan filter eksplisit.
+        libreoffice_path().is_some()
+    } else if pdf_input && target_ext == "html" {
+        libreoffice_path().is_some()
     } else if pdf_input {
-        ["docx", "txt", "html", "odt", "rtf"].contains(&target_ext) && libreoffice_path().is_some()
+        false
     } else if ext == "doc" {
         ["pdf", "docx", "odt", "rtf"].contains(&target_ext) && libreoffice_path().is_some()
     } else if office_input && target_ext == "pdf" {
@@ -855,7 +887,7 @@ fn convert_file(
     {
         let converter = pdf2docx_path().ok_or("pdf2docx tidak ditemukan.")?;
         let mut command = Command::new(&converter);
-        command.args(["convert"]).arg(source).arg("-d").arg(&output);
+        command.args(pdf2docx_convert_args(source, &output));
         run_engine_for_output(
             &mut command,
             "pdf2docx",
@@ -922,14 +954,7 @@ fn convert_file(
             .prefix("documorph-lo-")
             .tempdir()
             .map_err(|e| format!("Gagal membuat profile LibreOffice: {e}"))?;
-        let profile_url = format!(
-            "file:///{}",
-            profile
-                .path()
-                .to_string_lossy()
-                .replace('\\', "/")
-                .replace(' ', "%20")
-        );
+        let profile_url = libreoffice_profile_url(profile.path());
         let mut command = Command::new(lo);
         command
             .arg(format!("-env:UserInstallation={profile_url}"))
@@ -986,24 +1011,17 @@ fn convert_file(
             Some((staged_dir.as_path(), target_ext)),
         )?;
         ("Pandoc", "B", None)
-    } else if pdf_input {
+    } else if pdf_input && target_ext == "html" {
         let lo = libreoffice_path().ok_or("LibreOffice tidak ditemukan.")?;
         let profile = tempfile::Builder::new()
             .prefix("documorph-lo-")
             .tempdir()
             .map_err(|e| format!("Gagal membuat profile LibreOffice: {e}"))?;
-        let profile_url = format!(
-            "file:///{}",
-            profile
-                .path()
-                .to_string_lossy()
-                .replace('\\', "/")
-                .replace(' ', "%20")
-        );
+        let profile_url = libreoffice_profile_url(profile.path());
         let mut command = Command::new(lo);
         command
             .arg(format!("-env:UserInstallation={profile_url}"))
-            .args(["--headless", "--convert-to", target_ext, "--outdir"])
+            .args(["--headless", "--convert-to", "html", "--outdir"])
             .arg(output.parent().unwrap_or(Path::new(".")))
             .arg(source);
         run_engine_for_output(
@@ -1011,12 +1029,64 @@ fn convert_file(
             "LibreOffice (PDF import)",
             &output,
             &cancel,
-            Some((staged_dir.as_path(), target_ext)),
+            Some((staged_dir.as_path(), "html")),
         )?;
         (
             "LibreOffice (PDF import)",
             "C",
             Some("PDF adalah format visual; teks dan layout direkonstruksi, hasil bisa berubah signifikan. Scan memerlukan OCR.".into()),
+        )
+    } else if pdf_input && pdf_writer_route(target_ext) {
+        let lo = libreoffice_path().ok_or("LibreOffice tidak ditemukan.")?;
+        let profile = tempfile::Builder::new()
+            .prefix("documorph-lo-")
+            .tempdir()
+            .map_err(|e| format!("Gagal membuat profile LibreOffice: {e}"))?;
+        let profile_url = libreoffice_profile_url(profile.path());
+        let html_dir = tempfile::Builder::new()
+            .prefix("lo-html-")
+            .tempdir_in(staged_dir.as_path())
+            .map_err(|e| format!("Gagal membuat folder antara LibreOffice: {e}"))?;
+        let stem = safe_stem(
+            source
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("output"),
+        );
+        let html = html_dir.path().join(format!("{stem}.html"));
+
+        let mut draw = Command::new(&lo);
+        draw.arg(format!("-env:UserInstallation={profile_url}"))
+            .args(["--headless", "--convert-to", "html", "--outdir"])
+            .arg(html_dir.path())
+            .arg(source);
+        run_engine_for_output(
+            &mut draw,
+            "LibreOffice (PDF import)",
+            &html,
+            &cancel,
+            Some((html_dir.path(), "html")),
+        )?;
+
+        let mut writer = Command::new(&lo);
+        writer
+            .arg(format!("-env:UserInstallation={profile_url}"))
+            .args(["--headless", "--infilter=HTML (StarWriter)", "--convert-to"])
+            .arg(target_ext)
+            .arg("--outdir")
+            .arg(output.parent().unwrap_or(Path::new(".")))
+            .arg(&html);
+        run_engine_for_output(
+            &mut writer,
+            "LibreOffice (PDF import → Writer)",
+            &output,
+            &cancel,
+            Some((staged_dir.as_path(), target_ext)),
+        )?;
+        (
+            "LibreOffice (PDF import → Writer)",
+            "C",
+            Some("PDF diimpor sebagai HTML lalu disusun ulang dengan Writer. Teks, tabel, dan layout bisa berubah signifikan; scan memerlukan OCR.".into()),
         )
     } else if target_ext != "pdf" && office_input && office_output {
         let lo = libreoffice_path().ok_or("LibreOffice tidak ditemukan.")?;
@@ -1024,14 +1094,7 @@ fn convert_file(
             .prefix("documorph-lo-")
             .tempdir()
             .map_err(|e| format!("Gagal membuat profile LibreOffice: {e}"))?;
-        let profile_url = format!(
-            "file:///{}",
-            profile
-                .path()
-                .to_string_lossy()
-                .replace('\\', "/")
-                .replace(' ', "%20")
-        );
+        let profile_url = libreoffice_profile_url(profile.path());
         let mut command = Command::new(lo);
         command
             .arg(format!("-env:UserInstallation={profile_url}"))
@@ -1278,6 +1341,41 @@ mod tests {
         assert!(
             args.iter().all(|arg| arg != "convert"),
             "AnyMD akan mengira 'convert' sebagai nama file"
+        );
+    }
+
+    #[test]
+    fn pdf2docx_uses_positional_output_argument() {
+        let source = Path::new("laporan.pdf");
+        let output = Path::new("laporan.docx");
+        let args = pdf2docx_convert_args(source, output);
+
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], "convert");
+        assert_eq!(args[1], source.as_os_str());
+        assert_eq!(args[2], output.as_os_str());
+        assert!(
+            args.iter().all(|arg| arg != "-d"),
+            "pdf2docx tidak mengenal opsi -d"
+        );
+    }
+
+    #[test]
+    fn pdf_writer_route_covers_only_formats_libreoffice_can_export_from_html() {
+        for ext in ["docx", "txt", "odt", "rtf"] {
+            assert!(pdf_writer_route(ext), ".{ext} butuh rantai Draw -> Writer");
+        }
+        for ext in ["pdf", "html", "md", "csv"] {
+            assert!(!pdf_writer_route(ext), ".{ext} tidak memakai rantai Writer");
+        }
+    }
+
+    #[test]
+    fn libreoffice_profile_url_is_safe_for_windows_paths() {
+        let profile = Path::new(r"C:\Users\Evraldi\AppData\Local\Temp\documorph lo");
+        assert_eq!(
+            libreoffice_profile_url(profile),
+            "file:///C:/Users/Evraldi/AppData/Local/Temp/documorph%20lo"
         );
     }
 

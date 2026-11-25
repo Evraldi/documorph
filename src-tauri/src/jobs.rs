@@ -65,8 +65,21 @@ pub fn cancelled(flag: &AtomicBool) -> bool {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Registry job bersifat global; `cancel(None)` akan menyentuh flag test lain
+    /// kalau test berjalan paralel. Serialkan dan bersihkan registry tiap test.
+    fn isolated() -> MutexGuard<'static, ()> {
+        let lock = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(map) = flags().as_mut() {
+            map.clear();
+        }
+        lock
+    }
+
     #[test]
     fn cancel_only_targets_the_requested_job() {
+        let _isolated = isolated();
         let (first, _first_guard) = begin("first");
         let (second, _second_guard) = begin("second");
         cancel(Some("first"));
@@ -76,6 +89,7 @@ mod tests {
 
     #[test]
     fn cancel_without_id_stops_every_job() {
+        let _isolated = isolated();
         let (first, _first_guard) = begin("all-first");
         let (second, _second_guard) = begin("all-second");
         cancel(None);
@@ -85,6 +99,7 @@ mod tests {
 
     #[test]
     fn guard_unregisters_finished_job() {
+        let _isolated = isolated();
         let (flag, guard) = begin("finished");
         drop(guard);
         cancel(Some("finished"));
