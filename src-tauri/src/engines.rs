@@ -239,17 +239,42 @@ fn verify_engine(path: &Path, markers: &[&str]) -> bool {
 }
 
 fn locate(candidates: Vec<PathBuf>, markers: &[&str]) -> Option<PathBuf> {
+    locate_with(candidates, markers, |path| path.to_path_buf())
+}
+
+fn locate_with<F>(candidates: Vec<PathBuf>, markers: &[&str], probe_path: F) -> Option<PathBuf>
+where
+    F: Fn(&Path) -> PathBuf,
+{
     let mut seen: Vec<PathBuf> = Vec::new();
     for path in candidates {
         if seen.contains(&path) {
             continue;
         }
         seen.push(path.clone());
-        if verify_engine(&path, markers) {
+        if verify_engine(&probe_path(&path), markers) {
             return Some(path);
         }
     }
     None
+}
+
+/// LibreOffice menyediakan `soffice.com` di samping `soffice.exe`. Probe pada
+/// `.exe` memunculkan jendela `soffice.bin` yang menggantung sampai di-kill;
+/// kembaran console menjawab `--version`/`--help` tanpa jendela.
+fn console_probe_path(path: &Path) -> PathBuf {
+    if path.is_file()
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("exe"))
+    {
+        let console = path.with_extension("com");
+        if console.is_file() {
+            return console;
+        }
+    }
+    path.to_path_buf()
 }
 
 fn discover_all() -> EnginePaths {
@@ -364,7 +389,11 @@ fn discover_all() -> EnginePaths {
         anymd,
         pdf2docx,
         pandoc: locate(pandoc_candidates, &["pandoc"]),
-        libreoffice: locate(libreoffice_candidates, &["libreoffice", "soffice"]),
+        libreoffice: locate_with(
+            libreoffice_candidates,
+            &["libreoffice", "soffice"],
+            console_probe_path,
+        ),
         typst: locate(typst_candidates, &["typst"]),
         ocrmypdf: locate(ocrmypdf_candidates, &["ocrmypdf"]),
         tesseract: locate(tesseract_candidates, &["tesseract"]),
@@ -445,5 +474,42 @@ mod tests {
         assert_eq!(found.len(), 1, "hanya satu tool.exe dalam batas kedalaman");
         assert!(found[0].ends_with("tool.exe"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn libreoffice_probe_prefers_console_sibling() {
+        let dir = std::env::temp_dir().join(format!("documorph-lo-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create probe dir");
+        let exe = dir.join("soffice.exe");
+        let com = dir.join("soffice.com");
+        std::fs::write(&exe, b"exe").expect("write exe");
+        std::fs::write(&com, b"com").expect("write com");
+
+        assert_eq!(
+            console_probe_path(&exe),
+            com,
+            "probe harus memakai soffice.com supaya tidak memunculkan soffice.bin"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn libreoffice_probe_falls_back_without_console_sibling() {
+        let dir =
+            std::env::temp_dir().join(format!("documorph-lo-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create fallback dir");
+        let exe = dir.join("soffice.exe");
+        std::fs::write(&exe, b"exe").expect("write exe");
+
+        assert_eq!(
+            console_probe_path(&exe),
+            exe,
+            "tanpa soffice.com, probe tetap memakai path asli"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
