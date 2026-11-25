@@ -2,6 +2,7 @@ use pdfium_render::prelude::*;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
@@ -216,7 +217,7 @@ fn history_clear(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn engine_status() -> EngineStatus {
     EngineStatus {
         pandoc: pandoc_path().is_some(),
@@ -232,7 +233,7 @@ fn engine_status() -> EngineStatus {
 
 /// Tidak ada `OnceLock` yang mengunci error selamanya: engine dan PDFium
 /// dicari ulang setelah pengguna memperbaiki instalasi.
-#[tauri::command]
+#[tauri::command(async)]
 fn refresh_dependencies() -> EngineStatus {
     engines::refresh();
     *PDFIUM_INSTANCE
@@ -380,7 +381,7 @@ fn filter_inputs(paths: Vec<String>, extensions: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn preflight_file(app: AppHandle, input: String) -> Result<PreflightReport, String> {
     inspect_input(&app, &input)
 }
@@ -580,6 +581,16 @@ fn safe_stem(value: &str) -> String {
     }
 }
 
+/// AnyMD tidak punya subcommand `convert`: argumen pertama adalah file input.
+/// Menaruh `convert` di sana membuatnya mencari file bernama "convert".
+fn anymd_convert_args(source: &Path, output: &Path) -> [OsString; 3] {
+    [
+        source.as_os_str().to_os_string(),
+        OsString::from("-o"),
+        output.as_os_str().to_os_string(),
+    ]
+}
+
 /// Keluaran dibuat di folder data aplikasi dengan direktori unik per job.
 /// Tidak ada lagi penulisan di sebelah input yang bisa menimpa file milik user.
 fn staged_output(
@@ -631,7 +642,7 @@ fn settle_engine_output(output: &Path, dir: &Path, ext: &str) -> Result<(), Stri
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn convert_file(
     app: AppHandle,
     input: String,
@@ -820,7 +831,7 @@ fn convert_file(
     } else if target_ext == "md" {
         let anymd = anymd_path().ok_or("AnyMD tidak ditemukan.")?;
         let mut command = Command::new(&anymd);
-        command.args(["convert"]).arg(source).arg("-o").arg(&output);
+        command.args(anymd_convert_args(source, &output));
         run_engine_for_output(
             &mut command,
             "AnyMD",
@@ -843,11 +854,7 @@ fn convert_file(
             .map_err(|e| format!("Gagal membuat file sementara: {e}"))?;
         let markdown = temp.path().join("extracted.md");
         let mut extract = Command::new(&anymd);
-        extract
-            .args(["convert"])
-            .arg(source)
-            .arg("-o")
-            .arg(&markdown);
+        extract.args(anymd_convert_args(source, &markdown));
         run_engine_for_output(
             &mut extract,
             "AnyMD (PDF to Markdown)",
@@ -1124,6 +1131,22 @@ mod tests {
     fn safe_stem_removes_windows_reserved_characters() {
         assert_eq!(safe_stem("laporan:<bulan>"), "laporan__bulan_");
         assert_eq!(safe_stem("  "), "output");
+    }
+
+    #[test]
+    fn anymd_convert_args_do_not_include_convert_subcommand() {
+        let source = Path::new("skripsi.docx");
+        let output = Path::new("skripsi.md");
+        let args = anymd_convert_args(source, output);
+
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], source.as_os_str());
+        assert_eq!(args[1], "-o");
+        assert_eq!(args[2], output.as_os_str());
+        assert!(
+            args.iter().all(|arg| arg != "convert"),
+            "AnyMD akan mengira 'convert' sebagai nama file"
+        );
     }
 
     #[test]

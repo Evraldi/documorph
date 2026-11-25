@@ -250,3 +250,19 @@ test("engine stderr is redacted and Explorer opens are guarded", () => {
   assert.match(lib, /take_open_files,/);
   assert.match(read("src/App.tsx"), /take_open_files/);
 });
+
+test("engine probing and conversion run off the UI thread", () => {
+  const lib = read("src-tauri/src/lib.rs");
+  for (const command of [
+    "engine_status",
+    "refresh_dependencies",
+    "preflight_file",
+    "convert_file",
+  ]) {
+    assert.match(
+      lib,
+      new RegExp(`#\\[tauri::command\\(async\\)\\]\\s*fn ${command}\\b`),
+      `${command} tidak boleh menjadi command blocking`,
+    );
+  }
+});
