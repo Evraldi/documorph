@@ -715,15 +715,104 @@ fn settle_engine_output(output: &Path, dir: &Path, ext: &str) -> Result<(), Stri
     Ok(())
 }
 
+fn flag_disabled(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("0" | "false" | "no" | "off"))
+}
+
+fn env_flag_disabled(name: &str) -> bool {
+    flag_disabled(std::env::var(name).ok().as_deref())
+}
+
 /// Rute OCR untuk PDF→DOCX bisa dimatikan tanpa menghapus engine.
 fn pdf_docx_ocr_enabled() -> bool {
-    !matches!(
-        std::env::var("DOCUMORPH_PDF_DOCX_OCR")
-            .ok()
-            .as_deref()
-            .map(str::trim),
-        Some("0" | "false" | "no" | "off")
-    )
+    !env_flag_disabled("DOCUMORPH_PDF_DOCX_OCR")
+}
+
+/// Koreksi teks sidecar bisa dimatikan tanpa mematikan seluruh rute OCR.
+fn pdf_docx_sidecar_postprocess_enabled() -> bool {
+    !env_flag_disabled("DOCUMORPH_PDF_DOCX_SIDECAR_POSTPROCESS")
+}
+
+/// Sidecar OCRmyPDF hanya berisi teks tanpa confidence dan bbox per kata.
+/// Word disintesis dengan confidence 95 supaya kamus hanya menjalankan koreksi
+/// eksplisit yang konservatif. Token `0`/`2` dikecualikan dari normalisasi
+/// bullet karena tanpa bbox asli token angka di awal baris tabel bisa salah
+/// dianggap marker bullet.
+fn postprocess_sidecar_text(text: &str, config: &ocr_postprocess::PostprocessConfig) -> String {
+    if !pdf_docx_sidecar_postprocess_enabled() {
+        return text.to_string();
+    }
+    let mut output = String::new();
+    let mut first_page = true;
+    for (page_index, page_text) in text.split('\u{000C}').enumerate() {
+        if page_text.trim().is_empty() {
+            continue;
+        }
+        if !first_page {
+            output.push_str("\n\n");
+        }
+        first_page = false;
+        let mut first_line = true;
+        for (line_index, line) in page_text.lines().enumerate() {
+            if !first_line {
+                output.push('\n');
+            }
+            first_line = false;
+            let tokens: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+            if tokens.is_empty() {
+                continue;
+            }
+            let words: Vec<ocr_postprocess::OcrWord> = tokens
+                .iter()
+                .enumerate()
+                .map(|(word_index, token)| {
+                    let protected = if token == "0" {
+                        Some(("\u{E000}", "0"))
+                    } else if token == "2" {
+                        Some(("\u{E001}", "2"))
+                    } else {
+                        None
+                    };
+                    ocr_postprocess::OcrWord {
+                        page: page_index + 1,
+                        block: 0,
+                        paragraph: 0,
+                        line: line_index + 1,
+                        word: word_index,
+                        bbox: ocr_postprocess::BBox {
+                            left: (word_index * 100) as i32,
+                            top: (line_index * 20) as i32,
+                            width: 90,
+                            height: 18,
+                        },
+                        text: protected
+                            .map(|(sentinel, _)| sentinel.to_string())
+                            .unwrap_or_else(|| token.clone()),
+                        confidence: 95.0,
+                    }
+                })
+                .collect();
+            let (processed, corrections) = ocr_postprocess::postprocess(words, config, None);
+            for correction in corrections {
+                eprintln!(
+                    "[PDF→DOCX OCR] halaman {}: {} → {} ({})",
+                    correction.page, correction.before, correction.after, correction.rule
+                );
+            }
+            output.push_str(
+                &processed
+                    .iter()
+                    .map(|word| match word.text.as_str() {
+                        "\u{E000}" => "0",
+                        "\u{E001}" => "2",
+                        other => other,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+    }
+    output
 }
 
 /// `canonicalize()` di Windows menghasilkan prefiks `\\?\`. Path itu aman
@@ -882,6 +971,7 @@ fn choose_docx_ocr_text(
     run_engine_for_output(&mut command, "OCRmyPDF", &ocr_pdf, cancel, None)?;
     let ocrmypdf_text = std::fs::read_to_string(&sidecar)
         .map_err(|e| format!("Gagal membaca sidecar OCRmyPDF: {e}"))?;
+    let ocrmypdf_text = postprocess_sidecar_text(&ocrmypdf_text, &config);
 
     let confidence = confidence_total / confidence_words.max(1) as f32;
     eprintln!("[PDF→DOCX OCR] confidence={confidence:.2}");
@@ -2241,53 +2331,156 @@ mod tests {
         println!("SELECTOR BENAR: {correct}/11");
     }
 
+    #[test]
+    fn sidecar_postprocess_keeps_numeric_table_cells() {
+        let config = ocr_postprocess::PostprocessConfig::from_env();
+        assert_eq!(
+            postprocess_sidecar_text("2 Foo\n2 Bar", &config),
+            "2 Foo\n2 Bar"
+        );
+    }
+
+    #[test]
+    fn sidecar_postprocess_normalizes_noise_and_fractions() {
+        let config = ocr_postprocess::PostprocessConfig::from_env();
+        assert_eq!(
+            postprocess_sidecar_text("© Disk drive", &config),
+            "• Disk drive"
+        );
+        assert_eq!(
+            postprocess_sidecar_text("disk drive 312”", &config),
+            "disk drive 3½″"
+        );
+    }
+
+    #[test]
+    fn sidecar_postprocess_handles_form_feed_and_hides_sentinels() {
+        let config = ocr_postprocess::PostprocessConfig::from_env();
+        let output = postprocess_sidecar_text("© Disk drive\u{000C}© Disk drive", &config);
+        assert_eq!(output, "• Disk drive\n\n• Disk drive");
+        assert!(!output.contains('\u{E000}'));
+        assert!(!output.contains('\u{E001}'));
+    }
+
+    #[test]
+    fn rollback_flags_accept_the_same_disabled_values() {
+        for value in [Some("0"), Some(" false "), Some("no"), Some("off")] {
+            assert!(flag_disabled(value), "{value:?} harus dimatikan");
+        }
+        for value in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("OFF"),
+            Some("aktif"),
+        ] {
+            assert!(!flag_disabled(value), "{value:?} tidak boleh dimatikan");
+        }
+    }
+
+    #[test]
+    fn canonical_windows_prefix_is_removed_for_engine_paths() {
+        assert_eq!(
+            plain_windows_path(Path::new(r"\\?\C:\Program Files\Tesseract-OCR")),
+            Path::new(r"C:\Program Files\Tesseract-OCR")
+        );
+        assert_eq!(
+            plain_windows_path(Path::new(r"\\?\UNC\server\share\tessdata")),
+            Path::new(r"\\server\share\tessdata")
+        );
+        assert_eq!(
+            plain_windows_path(Path::new(r"C:\already\plain")),
+            Path::new(r"C:\already\plain")
+        );
+    }
+
     /// Tes runtime untuk fungsi produksi yang dipakai `convert_file`, bukan
     /// helper diagnosa. Jalankan dengan environment OCR default.
     #[test]
     #[ignore = "butuh Tesseract + OCRmyPDF + 11 PDF sample nyata"]
     fn pdf_to_docx_scan_route_matches_ground_truth() {
+        let (_, _, pandoc, _, _, _, _) = diag_engines();
         let pdfium = diag_pdfium();
         let temp = tempfile::tempdir().expect("tempdir");
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let limits: &[(&str, f64)] = &[
-            ("image-only-no-text", 0.01),
-            ("id-clean", 0.0),
-            ("id-noisy", 0.0),
-            ("id-skew", 0.0),
-            ("id-table", 0.16),
-            ("id-lowres", 0.0),
-            ("id-blur", 0.0),
-            ("id-rot90", 0.0),
-            ("id-table-skew", 0.22),
-            ("id-two-column", 0.0),
-            ("id-linn-noise", 0.02),
+        let limits: &[(&str, f64, f64)] = &[
+            ("image-only-no-text", 0.01, 0.01),
+            ("id-clean", 0.0, 0.0),
+            ("id-noisy", 0.0, 0.0),
+            ("id-skew", 0.0, 0.0),
+            ("id-table", 0.16, 0.18),
+            ("id-lowres", 0.0, 0.0),
+            ("id-blur", 0.0, 0.0),
+            ("id-rot90", 0.0, 0.0),
+            ("id-table-skew", 0.22, 0.28),
+            ("id-two-column", 0.0, 0.0),
+            ("id-linn-noise", 0.02, 0.02),
         ];
 
         for document in ocr_metrics::cross_documents() {
-            let max_cer = limits
+            let (max_cer, max_cer_ref) = limits
                 .iter()
-                .find(|(name, _)| *name == document.name)
-                .map(|(_, cer)| *cer)
+                .find(|(name, _, _)| *name == document.name)
+                .map(|(_, cer, cer_ref)| (*cer, *cer_ref))
                 .expect("batas CER untuk sample");
             let dir = temp.path().join(document.name);
             std::fs::create_dir_all(&dir).expect("dir sample");
             let (engine, text) = choose_docx_ocr_text(&pdfium, &document.pdf, &cancel, &dir)
                 .expect("rute OCR PDF→DOCX");
             let cer = ocr_metrics::cer(&document.reference, &text);
+            let cer_ref = ocr_metrics::cer_reference(&document.reference, &text);
+            let markdown = dir.join("route.md");
+            let docx = dir.join("route.docx");
+            std::fs::write(&markdown, &text).expect("tulis markdown produksi");
+            let mut command = Command::new(&pandoc);
+            command.arg(&markdown).arg("-o").arg(&docx);
+            diag_run("Pandoc", &mut command, &docx);
+            let (docx_text, tables, rows, cells, images) = diag_docx_summary(&docx);
+            let docx_cer = ocr_metrics::cer(&document.reference, &docx_text);
+            let docx_cer_ref = ocr_metrics::cer_reference(&document.reference, &docx_text);
             println!(
-                "{:<20} engine={engine:<18} CER={cer:.4} batas={max_cer:.4}",
+                "{:<20} engine={engine:<18} CER={cer:.4}/{cer_ref:.4} DOCX={docx_cer:.4}/{docx_cer_ref:.4} batas={max_cer:.4}/{max_cer_ref:.4} tbl={tables}/{rows}/{cells} img={images}",
                 document.name
             );
             assert!(
-                !text.contains('\u{00FF}'),
-                "{}: teks OCR mengandung U+00FF",
+                !text.contains('\u{00FF}') && !docx_text.contains('\u{00FF}'),
+                "{}: U+00FF masih ada di teks atau DOCX",
                 document.name
             );
             assert!(
-                cer <= max_cer,
-                "{}: CER {cer:.4} melebihi batas {max_cer:.4}",
+                !docx_text.contains('\u{E000}') && !docx_text.contains('\u{E001}'),
+                "{}: sentinel koreksi sidecar bocor ke DOCX",
                 document.name
             );
+            assert!(
+                cer <= max_cer && docx_cer <= max_cer + 1e-9,
+                "{}: CER {cer:.4}/DOCX {docx_cer:.4} melebihi batas {max_cer:.4}",
+                document.name
+            );
+            assert!(
+                cer_ref <= max_cer_ref && docx_cer_ref <= max_cer_ref + 1e-9,
+                "{}: CER-ref {cer_ref:.4}/DOCX {docx_cer_ref:.4} melebihi batas {max_cer_ref:.4}",
+                document.name
+            );
+            if document.name == "image-only-no-text" {
+                for token in ["Sequencer", "function", "is", "3½"] {
+                    assert!(
+                        docx_text.contains(token),
+                        "{}: DOCX tidak bisa dicari dengan '{token}'",
+                        document.name
+                    );
+                }
+            }
+            if document.name == "id-linn-noise" {
+                for token in ["Sequencer", "function", "is"] {
+                    assert!(
+                        docx_text.contains(token),
+                        "{}: DOCX tidak bisa dicari dengan '{token}'",
+                        document.name
+                    );
+                }
+            }
         }
     }
 }

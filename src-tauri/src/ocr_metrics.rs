@@ -140,6 +140,24 @@ pub fn wer(reference: &str, candidate: &str) -> f64 {
     levenshtein_words(&a, &b) as f64 / b.len().max(1) as f64
 }
 
+/// Varian dengan denominator ground truth, sesuai definisi CER/WER umum.
+/// Dipakai sebagai pelengkap pelaporan; batas regresi lama memakai `cer`.
+pub fn cer_reference(reference: &str, candidate: &str) -> f64 {
+    let reference = normalize_for_metrics(reference);
+    let candidate = normalize_for_metrics(candidate);
+    let a: Vec<char> = reference.chars().collect();
+    let b: Vec<char> = candidate.chars().collect();
+    levenshtein_chars(&a, &b) as f64 / a.len().max(1) as f64
+}
+
+pub fn wer_reference(reference: &str, candidate: &str) -> f64 {
+    let reference = normalize_for_metrics(reference);
+    let candidate = normalize_for_metrics(candidate);
+    let a: Vec<&str> = reference.split_whitespace().collect();
+    let b: Vec<&str> = candidate.split_whitespace().collect();
+    levenshtein_words(&a, &b) as f64 / a.len().max(1) as f64
+}
+
 /// Ambil hanya baris prosa dari hasil OCR. Baris yang awalnya bukan body
 /// (judul, heading, bullet, alamat) tidak ikut dihitung sebagai regresi body.
 pub fn body_only(text: &str) -> String {
@@ -184,4 +202,17 @@ pub fn print_metrics(label: &str, reference: &str, candidate: &str, body_referen
             .split_whitespace()
             .count(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cer, cer_reference, wer, wer_reference};
+
+    #[test]
+    fn reference_denominator_is_reported_separately() {
+        assert!(cer_reference("ab", "abc") > cer("ab", "abc"));
+        assert!(wer_reference("ab cd", "ab cd ef") > wer("ab cd", "ab cd ef"));
+        assert_eq!(cer_reference("abc", "abc"), 0.0);
+        assert_eq!(wer_reference("abc", "abc"), 0.0);
+    }
 }

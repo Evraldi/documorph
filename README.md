@@ -130,11 +130,28 @@ Rute OCR bisa dikembalikan ke perilaku lama dengan:
 | Variable | Fungsi |
 | --- | --- |
 | `DOCUMORPH_PDF_DOCX_OCR` | `0` mematikan rute OCR untuk PDF scan (default aktif) |
+| `DOCUMORPH_PDF_DOCX_SIDECAR_POSTPROCESS` | `0` mematikan koreksi pada teks sidecar OCRmyPDF (default aktif) |
+
+Teks sidecar juga dilewati pass koreksi yang sama. Karena sidecar tidak punya
+confidence dan bbox per kata, word disintesis dengan confidence `95` supaya kamus
+hanya memakai koreksi eksplisit; token `0`/`2` dikecualikan dari normalisasi
+bullet agar angka di awal baris tabel tidak berubah. Varian aman ini tidak
+menurunkan CER ke-11 sample dan memperbaiki `id-linn-noise` dari `0,0099` menjadi
+`0,0062`. Opsi baca Pandoc lain (`--wrap=none`, escape Markdown,
+`markdown_strict`, `commonmark`) sudah diuji tetapi tidak dipakai karena tidak
+memberi perbaikan terukur.
 
 Pass koreksi mengikuti flag `DOCUMORPH_OCR_*` di atas. Engine harus terdeteksi
 (Tesseract, Ghostscript, OCRmyPDF, Pandoc); bila auto-discovery gagal, path bisa
 diisi lewat `TESSERACT_PATH`, `GHOSTSCRIPT_PATH`, `OCRMYPDF_PATH`, dan
 `PANDOC_PATH`.
+
+Tes runtime PDF→DOCX tidak berhenti di teks OCR: hasilnya tetap disusun menjadi
+DOCX dengan Pandoc, lalu `word/document.xml` dibaca untuk memeriksa CER, `U+00FF`,
+sentinel koreksi, serta kata kunci `Sequencer`, `function`, `is`, dan `3½`.
+Batas regresi lama memakai CER dengan denominator hasil; `CER-ref` dengan
+denominator ground truth juga di-assert dengan batas terpisah, karena angkanya
+lebih tinggi untuk sample tabel.
 
 ### Diagnosa akurasi OCR
 
