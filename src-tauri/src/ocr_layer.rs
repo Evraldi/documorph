@@ -1518,10 +1518,108 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ");
             println!("    rotasi={rotation} teks={snippet}");
+            if std::env::var("DOCUMORPH_BENCH_OCRMYPDF").is_ok() {
+                let ocr = std::env::var("OCRMYPDF_PATH").unwrap_or_else(|_| {
+                    r"C:\Data\01_Development\python3.10.11\Scripts\ocrmypdf.exe".to_string()
+                });
+                let tesseract = tesseract_path();
+                let ghostscript = std::env::var("GHOSTSCRIPT_PATH")
+                    .unwrap_or_else(|_| r"C:\Program Files\gs\gs10.08.0\bin\gswin64c.exe".into());
+                let engine_path = std::env::join_paths([
+                    tesseract.parent().expect("dir Tesseract"),
+                    Path::new(&ghostscript).parent().expect("dir Ghostscript"),
+                    Path::new(r"C:\Windows\System32"),
+                ])
+                .expect("PATH engine");
+                let final_pdf = temp.path().join(format!("real-final-{index}.pdf"));
+                let ocr_started = Instant::now();
+                let mut command = Command::new(&ocr);
+                hide_console(&mut command);
+                let status = command
+                    .env("PATH", engine_path)
+                    .args(["--skip-text", "-l", "ind+eng"])
+                    .arg(&target)
+                    .arg(&final_pdf)
+                    .status()
+                    .expect("jalankan OCRmyPDF");
+                assert!(status.success(), "OCRmyPDF gagal: {status}");
+                let ocr_elapsed = ocr_started.elapsed().as_secs_f32();
+                let pipeline = elapsed + ocr_elapsed;
+                println!(
+                    "    ocrmypdf={ocr_elapsed:.2}s pipeline={pipeline:.2}s ({:.2}s/hal)",
+                    pipeline / rewrite.page_count as f32
+                );
+            }
         }
     }
 
-    /// Tes rute lengkap: OCRmyPDF --skip-text → koreksi → penulisan ulang layer.
+    /// Diagnosa trade-off skala render: page box 96 DPI (82 MP), piksel native
+    /// (8,4 MP), dan varian antara. Hasil empiris menolak "pakai piksel native"
+    /// sebagai guard: CER body naik dan waktunya tidak lebih cepat.
+    /// `DOCUMORPH_RENDER_CANDIDATES` berisi path PDF dipisah `;`.
+    #[test]
+    #[ignore = "butuh Tesseract + varian PDF linn"]
+    fn render_scale_tradeoff_diagnostic() {
+        let pdfium = pdfium_for_test();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let native = std::env::var("DOCUMORPH_NATIVE_PIXEL_PDF").unwrap_or_else(|_| {
+            r"C:\Users\Evraldi\AppData\Local\Temp\opencode\linn-correct-dpi.pdf".to_string()
+        });
+        let configured = std::env::var("DOCUMORPH_RENDER_CANDIDATES").unwrap_or_default();
+        let candidates: Vec<(String, String)> = if configured.trim().is_empty() {
+            vec![
+                ("page-box-96dpi".to_string(), sample_pdf_path()),
+                ("native-pixels".to_string(), native),
+            ]
+        } else {
+            configured
+                .split(';')
+                .filter(|path| !path.trim().is_empty())
+                .map(|path| {
+                    let path = path.trim().to_string();
+                    let label = Path::new(&path)
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    (label, path)
+                })
+                .collect()
+        };
+        let reference = ocr_metrics::full_reference();
+        let body = ocr_metrics::body_reference();
+        for (label, source) in candidates {
+            let target = temp.path().join(format!("{label}.pdf"));
+            fs::copy(&source, &target).unwrap_or_else(|error| panic!("copy {source}: {error}"));
+            let rewrite = rewrite_searchable_layer(
+                &pdfium,
+                &target,
+                Tesseract::new(tesseract_path(), "ind+eng".to_string()),
+                &PostprocessConfig::default(),
+                &AtomicBool::new(false),
+                temp.path(),
+            )
+            .unwrap_or_else(|error| panic!("rewrite {label}: {error}"));
+            let document = pdfium
+                .load_pdf_from_file(&target, None)
+                .unwrap_or_else(|error| panic!("buka {label}: {error}"));
+            let text = document
+                .pages()
+                .get(0)
+                .expect("halaman")
+                .text()
+                .expect("teks")
+                .all();
+            ocr_metrics::print_metrics(&label, &reference, &text, &body);
+            println!(
+                "    kata={} koreksi={}",
+                rewrite.word_count,
+                rewrite.corrections.len()
+            );
+        }
+    }
+
+    /// Tes rute lengkap: Tesseract → koreksi → text layer → OCRmyPDF --skip-text.
     /// Dijalankan manual:
     /// `cargo test --lib -- --ignored full_searchable_pdf_route`
     #[test]
@@ -1532,11 +1630,24 @@ mod tests {
         let input = temp.path().join("input.pdf");
         let output = temp.path().join("output.pdf");
         fs::copy(sample_pdf_path(), &input).expect("copy sample");
+        let original = render_bytes(&pdfium, &input, 796, 1030);
+
+        let tesseract = tesseract_path();
+        let cancel = AtomicBool::new(false);
+        let rewrite = rewrite_searchable_layer(
+            &pdfium,
+            &input,
+            Tesseract::new(tesseract.clone(), "ind+eng".to_string()),
+            &PostprocessConfig::default(),
+            &cancel,
+            temp.path(),
+        )
+        .expect("rewrite layer");
+        assert_eq!(original, render_bytes(&pdfium, &input, 796, 1030));
 
         let ocr = std::env::var("OCRMYPDF_PATH").unwrap_or_else(|_| {
             r"C:\Data\01_Development\python3.10.11\Scripts\ocrmypdf.exe".to_string()
         });
-        let tesseract = tesseract_path();
         let ghostscript = std::env::var("GHOSTSCRIPT_PATH")
             .unwrap_or_else(|_| r"C:\Program Files\gs\gs10.08.0\bin\gswin64c.exe".to_string());
         let engine_path = std::env::join_paths([
@@ -1557,19 +1668,6 @@ mod tests {
             .expect("jalankan OCRmyPDF");
         assert!(status.success(), "OCRmyPDF gagal: {status}");
 
-        let original = render_bytes(&pdfium, &input, 796, 1030);
-        assert_eq!(original, render_bytes(&pdfium, &output, 796, 1030));
-
-        let cancel = AtomicBool::new(false);
-        let rewrite = rewrite_searchable_layer(
-            &pdfium,
-            &output,
-            Tesseract::new(tesseract, "ind+eng".to_string()),
-            &PostprocessConfig::default(),
-            &cancel,
-            temp.path(),
-        )
-        .expect("rewrite layer");
         assert_eq!(original, render_bytes(&pdfium, &output, 796, 1030));
         assert_layer_quality(&pdfium, &output, &rewrite);
     }

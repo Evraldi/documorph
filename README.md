@@ -53,10 +53,13 @@ HTML lewat Draw lalu membukanya di Writer dengan filter eksplisit.
 
 ### Searchable PDF
 
-Rute **Alat PDF → Searchable PDF** mempertahankan piksel scan asli: OCRmyPDF
-dijalankan dengan `--skip-text` (tanpa `--deskew`/`--rotate-pages`), lalu lapisan
-teks bawaan dibuang. Halaman dirender ulang pada 300 DPI **apa adanya** untuk
-dibaca Tesseract; binarisasi, denoise, dan upscale tidak dipakai untuk body text.
+Rute **Alat PDF → Searchable PDF** mempertahankan piksel scan asli: halaman
+dirender pada 300 DPI **apa adanya** untuk dibaca Tesseract, lalu kata hasil
+koreksi ditulis sebagai text layer invisible. OCRmyPDF baru dijalankan setelahnya
+dengan `--skip-text` (tanpa `--deskew`/`--rotate-pages`) sehingga hanya mengubah
+struktur/PDF-A dan tidak mengulang OCR full-page. Urutan ini menghemat satu kali
+OCR per halaman dibanding menjalankan OCRmyPDF lebih dulu lalu membuang layer-nya.
+Binarisasi, denoise, dan upscale tidak dipakai untuk body text.
 Sebelum OCR, orientasi halaman dicek memakai Tesseract OSD (`--psm 0`) pada thumbnail
 kecil. Bila terdeteksi 90°/180°/270° dengan confidence memadai, gambar diputar
 sebelum OCR dan bbox kata dikembalikan ke koordinat halaman asli saat text layer
@@ -146,8 +149,9 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture r
 Daftar PDF bisa diganti lewat `DOCUMORPH_REAL_SCANS` (path dipisah `;`).
 Tambahkan `$env:DOCUMORPH_TIMING = '1'` untuk memecah waktu rewrite menjadi
 render, konversi RGBA, OSD, OCR full-page, OCR ulang judul, penulisan objek
-teks, regenerate, dan save. Tahap OCRmyPDF `--skip-text` diukur terpisah dengan
-skrip eksternal; angka waktu per halaman pipeline = OCRmyPDF + rewrite.
+teks, regenerate, dan save. Tambahkan `$env:DOCUMORPH_BENCH_OCRMYPDF = '1'` untuk
+menjalankan OCRmyPDF `--skip-text` setelah rewrite dan mencetak total pipeline;
+angka waktu per halaman = rewrite + OCRmyPDF.
 
 Penulisan layer sengaja memakai
 `PdfPageContentRegenerationStrategy::Manual`: default `pdfium-render`

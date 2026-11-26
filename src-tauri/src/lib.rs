@@ -785,7 +785,78 @@ fn convert_file(
         ];
         let joined = std::env::join_paths(search_path)
             .map_err(|e| format!("PATH engine tidak valid: {e}"))?;
-        let (ocr_output, sidecar) = if target_key == "searchable pdf" {
+        let searchable = target_key == "searchable pdf";
+        let config = if searchable {
+            Some(ocr_postprocess::PostprocessConfig::from_env())
+        } else {
+            None
+        };
+        let mut layer_note = String::new();
+
+        // Searchable PDF: Tesseract kita yang menjalankan OCR sekali, lalu
+        // OCRmyPDF --skip-text hanya mengubah struktur/PDF-A. Urutan lama
+        // (OCRmyPDF OCR → buang layer → OCR Tesseract lagi) membayar dua kali
+        // OCR full-page untuk setiap halaman.
+        let ocr_input = if searchable {
+            match config.as_ref() {
+                Some(config) if config.enabled => {
+                    let layer_dir = staged_dir.join("layer-input");
+                    std::fs::create_dir_all(&layer_dir)
+                        .map_err(|e| format!("Gagal membuat direktori layer: {e}"))?;
+                    let with_layer = layer_dir.join("with-layer.pdf");
+                    std::fs::copy(source, &with_layer)
+                        .map_err(|e| format!("Gagal menyiapkan input layer: {e}"))?;
+                    let pdfium = pdfium_instance(&app)?;
+                    let engine =
+                        ocr_layer::Tesseract::new(tesseract.clone(), "ind+eng".to_string());
+                    let rewrite = ocr_layer::rewrite_searchable_layer(
+                        &pdfium,
+                        &with_layer,
+                        engine,
+                        config,
+                        &cancel,
+                        &layer_dir,
+                    )?;
+                    layer_note = format!(
+                        "Lapisan teks ditulis ulang: {} kata pada {} halaman (sebelum OCRmyPDF).",
+                        rewrite.word_count, rewrite.page_count
+                    );
+                    if !rewrite.corrections.is_empty() {
+                        warnings.push(format!(
+                            "Koreksi kata-level: {} perubahan sebelum text layer ditulis.",
+                            rewrite.corrections.len()
+                        ));
+                        for correction in rewrite.corrections.iter().take(10) {
+                            warnings.push(format!(
+                                "Halaman {}: {} → {} ({})",
+                                correction.page,
+                                correction.before,
+                                correction.after,
+                                correction.rule
+                            ));
+                        }
+                        if rewrite.corrections.len() > 10 {
+                            warnings.push(format!(
+                                "… dan {} koreksi lainnya.",
+                                rewrite.corrections.len() - 10
+                            ));
+                        }
+                    }
+                    with_layer
+                }
+                _ => {
+                    warnings.push(
+                        "Post-processing OCR dimatikan; text layer OCRmyPDF dipertahankan apa adanya."
+                            .into(),
+                    );
+                    source.to_path_buf()
+                }
+            }
+        } else {
+            source.to_path_buf()
+        };
+
+        let (ocr_output, sidecar) = if searchable {
             (output.clone(), None)
         } else {
             let temp = tempfile::Builder::new()
@@ -797,9 +868,9 @@ fn convert_file(
         };
         let mut command = Command::new(ocr);
         command.env("PATH", joined).args(["-l", "ind+eng"]);
-        if target_key == "searchable pdf" {
+        if searchable {
             // Deskew/rotate mengubah piksel asli; untuk searchable PDF lapse
-            // teks ditulis ulang di atas gambar yang benar-benar tidak diubah.
+            // teks sudah ditulis Tesseract di atas gambar yang tidak diubah.
             command.arg("--skip-text");
         } else {
             command.args(["--deskew", "--rotate-pages", "--force-ocr"]);
@@ -808,8 +879,8 @@ fn convert_file(
             let sidecar_path = output.with_extension("txt");
             command.arg("--sidecar").arg(&sidecar_path);
         }
-        command.arg(source).arg(&ocr_output);
-        let expected_output = if target_key == "searchable pdf" {
+        command.arg(&ocr_input).arg(&ocr_output);
+        let expected_output = if searchable {
             output.as_path()
         } else {
             ocr_output.as_path()
@@ -830,50 +901,6 @@ fn convert_file(
             return Err("OCR selesai tanpa menghasilkan file teks sidecar.".into());
         }
         drop(sidecar);
-
-        let mut layer_note = String::new();
-        if target_key == "searchable pdf" {
-            let config = ocr_postprocess::PostprocessConfig::from_env();
-            if config.enabled {
-                let pdfium = pdfium_instance(&app)?;
-                let engine = ocr_layer::Tesseract::new(tesseract, "ind+eng".to_string());
-                let rewrite = ocr_layer::rewrite_searchable_layer(
-                    &pdfium,
-                    &output,
-                    engine,
-                    &config,
-                    &cancel,
-                    &staged_dir,
-                )?;
-                layer_note = format!(
-                    "Lapisan teks ditulis ulang: {} kata pada {} halaman.",
-                    rewrite.word_count, rewrite.page_count
-                );
-                if !rewrite.corrections.is_empty() {
-                    warnings.push(format!(
-                        "Koreksi kata-level: {} perubahan sebelum text layer ditulis.",
-                        rewrite.corrections.len()
-                    ));
-                    for correction in rewrite.corrections.iter().take(10) {
-                        warnings.push(format!(
-                            "Halaman {}: {} → {} ({})",
-                            correction.page, correction.before, correction.after, correction.rule
-                        ));
-                    }
-                    if rewrite.corrections.len() > 10 {
-                        warnings.push(format!(
-                            "… dan {} koreksi lainnya.",
-                            rewrite.corrections.len() - 10
-                        ));
-                    }
-                }
-            } else {
-                warnings.push(
-                    "Post-processing OCR dimatikan; text layer OCRmyPDF dipertahankan apa adanya."
-                        .into(),
-                );
-            }
-        }
 
         let report = ConversionReport {
             output: output.to_string_lossy().into_owned(),
