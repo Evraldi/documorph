@@ -1,0 +1,16 @@
+Panduan Pengguna Sistem Antrian
+
+Sistem ini digunakan untuk mengelola antrian pelanggan di kantor cabang. Setiap pengunjung akan mendapatkan nomor antrian secara otomatis.
+
+Cara Menggunakan
+
+- Ambil nomor antrian pada mesin yang tersedia di dekat pintu masuk.
+- Tunggu hingga nomor Anda dipanggil melalui layar display.
+- Serahkan dokumen yang diperlukan ke petugas loket.
+- Pembayaran dapat dilakukan secara tunai atau transfer.
+
+Data yang dicatat meliputi nama, alamat, nomor telepon, dan jenis layanan. Terdapat 32 loket yang tersebar di seluruh cabang. Setiap loket melayani lima pelanggan dalam satu jam.
+
+Perhatian
+
+Mohon hadir tepat waktu. Jika nomor Anda terlewat, silakan mengambil nomor baru. Informasi lebih lanjut dapat diperoleh dari petugas atau melalui laman resmi kami.

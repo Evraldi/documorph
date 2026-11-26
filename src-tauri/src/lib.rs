@@ -5,7 +5,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, State};
@@ -14,11 +14,15 @@ mod db;
 mod engines;
 mod jobs;
 mod limits;
+mod ocr_layer;
+#[cfg(test)]
+mod ocr_metrics;
+mod ocr_postprocess;
 mod output_guard;
 mod pdfium_guard;
 mod process;
 
-static PDFIUM_INSTANCE: Mutex<Option<Result<Pdfium, String>>> = Mutex::new(None);
+static PDFIUM_INSTANCE: Mutex<Option<Result<Arc<Pdfium>, String>>> = Mutex::new(None);
 
 /// Path yang dibuka dari Explorer ditampung sampai frontend siap mengambilnya.
 #[derive(Default)]
@@ -285,9 +289,9 @@ fn pdfium_library_path(app: &AppHandle) -> Option<PathBuf> {
         .find(|path| path.is_file() && pdfium_guard::verify(path).is_ok())
 }
 
-fn inspect_pdf(app: &AppHandle, path: &Path) -> Result<Vec<String>, String> {
-    // Guard ditahan selama inspeksi supaya refresh tidak membuang instance
-    // yang sedang dipakai. Error tidak di-cache permanen.
+/// Instance PDFium dipakai bersama preflight dan penulisan text layer.
+/// `Arc` membuat guard mutex tidak perlu ditahan saat OCR berjalan.
+fn pdfium_instance(app: &AppHandle) -> Result<Arc<Pdfium>, String> {
     let mut instance = PDFIUM_INSTANCE
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -296,13 +300,16 @@ fn inspect_pdf(app: &AppHandle, path: &Path) -> Result<Vec<String>, String> {
             .ok_or_else(|| "PDFium DLL tidak ditemukan atau tidak valid.".to_string())?;
         let bindings =
             Pdfium::bind_to_library(library).map_err(|e| format!("Gagal memuat PDFium: {e}"))?;
-        *instance = Some(Ok(Pdfium::new(bindings)));
+        *instance = Some(Ok(Arc::new(Pdfium::new(bindings))));
     }
-    let pdfium = instance
-        .as_ref()
-        .expect("instance")
-        .as_ref()
-        .map_err(Clone::clone)?;
+    match instance.as_ref().expect("instance") {
+        Ok(pdfium) => Ok(Arc::clone(pdfium)),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn inspect_pdf(app: &AppHandle, path: &Path) -> Result<Vec<String>, String> {
+    let pdfium = pdfium_instance(app)?;
     let document = pdfium.load_pdf_from_file(path, None).map_err(|e| {
         format!("PDF tidak dapat dibuka (mungkin rusak atau dilindungi password): {e}")
     })?;
@@ -725,7 +732,7 @@ fn convert_file(
         return Err("File sumber tidak ditemukan.".into());
     }
     limits::check_input_size(source)?;
-    let warnings = inspect_input(&app, &input)
+    let mut warnings = inspect_input(&app, &input)
         .map(|report| report.warnings)
         .unwrap_or_default();
 
@@ -789,13 +796,13 @@ fn convert_file(
             (temp_pdf, Some(temp))
         };
         let mut command = Command::new(ocr);
-        command
-            .env("PATH", joined)
-            .args(["--deskew", "--rotate-pages", "-l", "ind+eng"]);
+        command.env("PATH", joined).args(["-l", "ind+eng"]);
         if target_key == "searchable pdf" {
+            // Deskew/rotate mengubah piksel asli; untuk searchable PDF lapse
+            // teks ditulis ulang di atas gambar yang benar-benar tidak diubah.
             command.arg("--skip-text");
         } else {
-            command.arg("--force-ocr");
+            command.args(["--deskew", "--rotate-pages", "--force-ocr"]);
         }
         if target_key == "ocr text" {
             let sidecar_path = output.with_extension("txt");
@@ -823,6 +830,51 @@ fn convert_file(
             return Err("OCR selesai tanpa menghasilkan file teks sidecar.".into());
         }
         drop(sidecar);
+
+        let mut layer_note = String::new();
+        if target_key == "searchable pdf" {
+            let config = ocr_postprocess::PostprocessConfig::from_env();
+            if config.enabled {
+                let pdfium = pdfium_instance(&app)?;
+                let engine = ocr_layer::Tesseract::new(tesseract, "ind+eng".to_string());
+                let rewrite = ocr_layer::rewrite_searchable_layer(
+                    &pdfium,
+                    &output,
+                    engine,
+                    &config,
+                    &cancel,
+                    &staged_dir,
+                )?;
+                layer_note = format!(
+                    "Lapisan teks ditulis ulang: {} kata pada {} halaman.",
+                    rewrite.word_count, rewrite.page_count
+                );
+                if !rewrite.corrections.is_empty() {
+                    warnings.push(format!(
+                        "Koreksi kata-level: {} perubahan sebelum text layer ditulis.",
+                        rewrite.corrections.len()
+                    ));
+                    for correction in rewrite.corrections.iter().take(10) {
+                        warnings.push(format!(
+                            "Halaman {}: {} → {} ({})",
+                            correction.page, correction.before, correction.after, correction.rule
+                        ));
+                    }
+                    if rewrite.corrections.len() > 10 {
+                        warnings.push(format!(
+                            "… dan {} koreksi lainnya.",
+                            rewrite.corrections.len() - 10
+                        ));
+                    }
+                }
+            } else {
+                warnings.push(
+                    "Post-processing OCR dimatikan; text layer OCRmyPDF dipertahankan apa adanya."
+                        .into(),
+                );
+            }
+        }
+
         let report = ConversionReport {
             output: output.to_string_lossy().into_owned(),
             engine: "OCRmyPDF + Tesseract + Ghostscript".into(),
@@ -832,7 +884,9 @@ fn convert_file(
                 "OCR Text merasterisasi halaman sebelum OCR; akurasi tergantung kualitas scan."
                     .into()
             } else {
-                "Akurasi OCR bergantung pada kualitas scan; lapisan teks yang sudah ada dipertahankan dengan --skip-text.".into()
+                format!(
+                    "Akurasi OCR bergantung pada kualitas scan; gambar asli dipertahankan dengan --skip-text. {layer_note}"
+                )
             }),
         };
         record_history(&app, source, &report, &warnings)?;

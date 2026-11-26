@@ -1,0 +1,5 @@
+No Jenis Layanan Durasi Loket
+1 Pembayaran 10 menit 1
+2 Pengambilan 5 menit 2
+3 Komplain 15 menit 3
+4 Lainnya 8 menit 32

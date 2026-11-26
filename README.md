@@ -51,6 +51,125 @@ menjelaskan keterbatasan rute yang dipilih. LibreOffice tidak bisa mengekspor
 PDF langsung ke DOCX/ODT/TXT/RTF, jadi rute cadangannya mengimpor PDF sebagai
 HTML lewat Draw lalu membukanya di Writer dengan filter eksplisit.
 
+### Searchable PDF
+
+Rute **Alat PDF → Searchable PDF** mempertahankan piksel scan asli: OCRmyPDF
+dijalankan dengan `--skip-text` (tanpa `--deskew`/`--rotate-pages`), lalu lapisan
+teks bawaan dibuang. Halaman dirender ulang pada 300 DPI **apa adanya** untuk
+dibaca Tesseract; binarisasi, denoise, dan upscale tidak dipakai untuk body text.
+Sebelum OCR, orientasi halaman dicek memakai Tesseract OSD (`--psm 0`) pada thumbnail
+kecil. Bila terdeteksi 90°/180°/270° dengan confidence memadai, gambar diputar
+sebelum OCR dan bbox kata dikembalikan ke koordinat halaman asli saat text layer
+ditulis. Ini tidak mengubah piksel PDF dan tidak memakai `--rotate-pages` OCRmyPDF.
+karena ketiganya tidak memperbaiki CER pada sample. Upscale hanya dipakai pada
+crop judul/font besar outlier, dengan padding supaya huruf di tepi halaman tidak
+terpotong. Kandidat OCR ulang judul juga ditolak bila lebih pendek lebih dari satu
+karakter (mis. `LinnSequencer` → `e` adalah potongan crop, bukan koreksi).
+Setiap kata ditulis kembali sebagai teks render mode 3 (invisible) pada
+bbox-nya. Pemisah di dalam text object memakai spasi, bukan `\n`: font WinAnsi
+tidak punya glyph newline sehingga PDFium menulis byte `0xFF` yang terbaca
+sebagai `ÿ`. Lapisan memakai font TrueType/CID Unicode agar `″` benar-benar
+ter-encode sebagai U+2033. Baseline dan ukuran font disamakan per baris supaya
+ekstraktor tidak menyisipkan newline di tengah kalimat. Rute **OCR Text** tidak
+berubah (`--deskew --rotate-pages --force-ocr --sidecar`).
+
+Koreksi sengaja konservatif supaya body text tidak rusak: kamus hanya menyentuh
+token yang tidak dikenal, confidence rendah, edit distance tepat 1, dan
+kandidatnya muncul minimal 3 kali sebagai kata benar di dokumen yang sama.
+Kandidat frekuensi juga harus berupa kata alpha minimal 3 karakter; token pendek
+dan token bertanda baca terbukti salah mengoreksi kata lain pada scan noisy.
+Pengecualian eksplisit: `1s` → `is` hanya bila `is` dominan, dan `pedai,` →
+`pedal,`. Infleksi/plural tidak diubah. `32` tidak pernah dianggap pecahan;
+normalisasi `312”`/`3½ÿ` → `3½″` hanya di konteks "disk drive". Hyphen akhir baris
+tetap dua fragmen (`func-`, `tion.`) agar tidak muncul `function tion`. Baris
+dibentuk dari `line_num` Tesseract (bukan posisi-x awal); urutan asli dipertahankan
+karena pengurutan geometris penuh menaikkan CER body dan CER full (0,0025 →
+0,0117). `Additional Features` sudah berada di posisi yang diharapkan ground truth
+pada urutan Tesseract asli, jadi tidak dipindah. Helper XY-cut/gap whitespace tetap
+dipakai untuk analisis blok dan regresi. Bullet yang
+tidak terdeteksi Tesseract disisipkan bila kata pertamanya confidence 0 dan
+berada di kolom bullet yang sama dengan item sebelumnya; baris lanjutannya tetap
+menempel pada bullet induknya.
+
+Setiap koreksi dicatat di riwayat dengan format `Halaman n: sebelum → sesudah
+(rule)`, maksimal 10 entri pertama plus ringkasan sisanya. Semua pass bisa
+dimatikan dengan nilai `0`, `false`, `no`, atau `off`:
+
+| Variable | Fungsi |
+| --- | --- |
+| `DOCUMORPH_OCR_POSTPROCESS` | Matikan/aktifkan seluruh koreksi + penulisan ulang layer |
+| `DOCUMORPH_OCR_ROTATION` | Deteksi orientasi Tesseract OSD (`--psm 0`) dan putar gambar sebelum OCR |
+| `DOCUMORPH_OCR_DICTIONARY` | Koreksi ejaan sangat konservatif + `1s`→`is` dan `pedai,`→`pedal,` |
+| `DOCUMORPH_OCR_LAYOUT` | Pertahankan urutan Tesseract; analisis blok XY-cut + bullet satu blok |
+| `DOCUMORPH_OCR_BULLET` | Normalisasi bullet margin kiri + sisipkan bullet yang gagal terdeteksi |
+| `DOCUMORPH_OCR_HYPHEN` | Pertahankan dua fragmen hyphen tanpa duplikasi kata |
+| `DOCUMORPH_OCR_FRACTION` | `312”`/`3½ÿ` → `3½″` hanya di konteks "disk drive"; `32` tidak disentuh |
+| `DOCUMORPH_OCR_RENDER_DPI` | DPI render OCR (minimum 300) |
+| `DOCUMORPH_OCR_RERENDER_DPI` | DPI crop untuk OCR ulang font besar outlier |
+| `DOCUMORPH_OCR_DICTIONARY_EXTRA` | Kata tambahan yang dikecualikan, dipisah `,` atau `;` |
+
+### Diagnosa akurasi OCR
+
+Ground truth sample disimpan di `tests/fixtures/linn-sequencer.ground-truth.txt`
+(diambil dari resource upstream OCRmyPDF, bukan dari hasil OCR aplikasi) dan
+`tests/fixtures/linn-sequencer.body-ground-truth.txt` untuk metrik body saja.
+Jalankan:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture ground_truth_metrics
+```
+
+Perintah ini mencetak CER/WER untuk varian preprocessing (`raw`, `gray`,
+`binary`, `denoise`, `upscale`) dan untuk setiap langkah koreksi. Tes gagal bila
+ada langkah yang menaikkan CER body text lebih dari 0,005, jadi perbaikan yang
+merusak body tidak boleh di-merge.
+
+Regresi lintas dokumen menjalankan 11 scan (bersih, noisy, miring, rot90, tabel,
+tabel miring, lowres, blur, dua kolom, linn asli, linn+noise) dengan ground truth
+dari teks sumber:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture cross_document_metrics
+```
+
+Setiap tahap juga tidak boleh menaikkan CER body lebih dari 0,005. Tambahkan
+`$env:DOCUMORPH_CROSS_FILTER = 'id-noisy'` untuk menjalankan satu dokumen dan
+mencetak daftar koreksinya.
+
+Benchmark 5 scan asli (linn, skew, rotated skew, grafik, Prancis) mencetak
+jumlah kata, koreksi, dan detik per halaman untuk tahap rewrite layer:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture real_scan_benchmark
+```
+
+Daftar PDF bisa diganti lewat `DOCUMORPH_REAL_SCANS` (path dipisah `;`).
+Tambahkan `$env:DOCUMORPH_TIMING = '1'` untuk memecah waktu rewrite menjadi
+render, konversi RGBA, OSD, OCR full-page, OCR ulang judul, penulisan objek
+teks, regenerate, dan save. Tahap OCRmyPDF `--skip-text` diukur terpisah dengan
+skrip eksternal; angka waktu per halaman pipeline = OCRmyPDF + rewrite.
+
+Penulisan layer sengaja memakai
+`PdfPageContentRegenerationStrategy::Manual`: default `pdfium-render`
+meng-regenerate content stream scan 300 DPI setelah setiap objek kata, yang
+membuat biaya tumbuh linier dengan jumlah kata. Semua objek ditulis dulu, lalu
+content diregenerate sekali per halaman.
+
+Halaman yang terdeteksi terbalik diverifikasi terpisah:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored rotated_pdf_text_layer
+```
+
+Tes ini memastikan text layer mengikuti piksel scan asli (bukan gambar hasil
+rotasi): kata-kata judul pada halaman 90° punya `left` yang sama dan `top`
+berurutan.
+
+Tes runtime ignored juga memeriksa hasil ekstraksi `pdftotext` dan PyMuPDF: tidak
+boleh ada `U+00FF`, tanda inci harus terbaca `U+2033`, dan pencarian PDFium untuk
+`Sequencer`, `3½`, `function`, serta `is` harus tetap menemukan hasil. Setel
+`DOCUMORPH_PDFTOTEXT` / `DOCUMORPH_PYTHON` bila letak keduanya berbeda.
+
 ## Deteksi engine
 
 Kandidat diperiksa dari lokasi eksplisit (bukan PATH): env var per engine

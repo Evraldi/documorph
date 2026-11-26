@@ -312,6 +312,98 @@ test("PDF to Writer documents uses real engine routes", () => {
   assert.match(readme, /LibreOffice Draw → Writer/);
 });
 
+test("searchable PDF rewrites an invisible word layer after correction", () => {
+  const lib = read("src-tauri/src/lib.rs");
+  const layer = read("src-tauri/src/ocr_layer.rs");
+  const postprocess = read("src-tauri/src/ocr_postprocess.rs");
+  const readme = read("README.md");
+  assert.match(lib, /target_key == "searchable pdf"/);
+  const skipAt = lib.indexOf('command.arg("--skip-text")');
+  assert.ok(skipAt > 0, "halaman searchable harus memakai --skip-text");
+  const branch = lib.slice(skipAt, lib.indexOf("} else {", skipAt));
+  assert.equal(branch.includes("--deskew"), false);
+  assert.equal(branch.includes("--rotate-pages"), false);
+  assert.match(lib, /rewrite_searchable_layer\(/);
+  assert.match(lib, /Halaman \{\}: \{\} → \{\} \(\{\}\)/);
+  assert.match(layer, /PdfPageTextRenderMode::Invisible/);
+  assert.match(layer, /word_separator/);
+  assert.match(layer, /pdftotext/);
+  assert.match(layer, /pymupdf/);
+  assert.match(layer, /sample_image_only_pdf_gets_correct_invisible_text_layer/);
+  assert.match(postprocess, /DOCUMORPH_OCR_POSTPROCESS/);
+  for (const flag of [
+    "DOCUMORPH_OCR_ROTATION",
+    "DOCUMORPH_OCR_DICTIONARY",
+    "DOCUMORPH_OCR_LAYOUT",
+    "DOCUMORPH_OCR_BULLET",
+    "DOCUMORPH_OCR_HYPHEN",
+    "DOCUMORPH_OCR_FRACTION",
+    "DOCUMORPH_OCR_RENDER_DPI",
+    "DOCUMORPH_OCR_RERENDER_DPI",
+    "DOCUMORPH_OCR_DICTIONARY_EXTRA",
+  ]) {
+    assert.ok(postprocess.includes(flag), `${flag} harus ada di backend`);
+    assert.ok(readme.includes(flag), `${flag} harus didokumentasikan`);
+  }
+});
+
+test("OCR corrections keep body text accuracy guarded by ground truth", () => {
+  const postprocess = read("src-tauri/src/ocr_postprocess.rs");
+  const layer = read("src-tauri/src/ocr_layer.rs");
+  const metrics = read("src-tauri/src/ocr_metrics.rs");
+  const readme = read("README.md");
+  const fullTruth = read("tests/fixtures/linn-sequencer.ground-truth.txt");
+  const bodyTruth = read("tests/fixtures/linn-sequencer.body-ground-truth.txt");
+
+  assert.ok(fullTruth.includes("The LinnSequencer"));
+  assert.ok(fullTruth.includes("LINN UR"));
+  assert.ok(bodyTruth.includes("professional musician"));
+  assert.equal(fullTruth.includes("Sequence Recorder"), true);
+
+  assert.match(postprocess, /dictionary-explicit/);
+  assert.match(postprocess, /bullet-insert/);
+  assert.match(layer, /text_font\(/);
+
+  for (const token of [
+    "or",
+    "is",
+    "why",
+    "designed",
+    "existing",
+    "gone",
+    "channels",
+    "last",
+    "them",
+  ]) {
+    assert.ok(postprocess.includes(`"${token}"`), `${token} harus dilindungi kamus`);
+  }
+  assert.match(postprocess, /MIN_CANDIDATE_FREQUENCY: usize = 3/);
+  assert.match(postprocess, /MAX_CORRECTABLE_CONFIDENCE: f32 = 90\.0/);
+  assert.match(postprocess, /bounded_edit_distance\(&key, candidate, 1\) != Some\(1\)/);
+  assert.match(postprocess, /same_inflection_shape/);
+  assert.match(postprocess, /word\.text\.trim\(\) != "32"/);
+  assert.match(postprocess, /in_disk_drive_context/);
+  assert.match(postprocess, /fn preserve_hyphens/);
+  assert.equal(postprocess.includes("hyphen-join-search"), false);
+  assert.match(postprocess, /fn geometric_lines/);
+  assert.match(postprocess, /groups\.entry\(line_key\(word\)\)/);
+  assert.match(postprocess, /if gaps\.len\(\) < 2/);
+  assert.match(postprocess, /fn split_bands/);
+  assert.match(postprocess, /fn split_columns/);
+  assert.match(postprocess, /parent_bullet/);
+
+  assert.match(layer, /ground_truth_metrics_track_preprocessing_and_each_stage/);
+  assert.match(layer, /fn binarized/);
+  assert.match(layer, /fn denoised/);
+  assert.match(layer, /fn upscaled_nearest/);
+  assert.match(layer, /crop_upscaled/);
+  assert.match(metrics, /pub fn cer/);
+  assert.match(metrics, /pub fn wer/);
+  assert.match(readme, /ground_truth_metrics/);
+  assert.match(readme, /CER/);
+  assert.match(readme, /body text/);
+});
+
 test("engine probing and conversion run off the UI thread", () => {
   const lib = read("src-tauri/src/lib.rs");
   for (const command of [
