@@ -369,9 +369,9 @@ function App() {
   const confirmClearHistory = async () => {
     setConfirmClear(false);
     try {
-      await invoke("history_clear");
+      const deleted = await invoke<number>("history_clear");
       setHistory([]);
-      setNotice("Riwayat dihapus.");
+      setNotice(`Riwayat dihapus. ${deleted} file keluaran ikut dihapus.`);
     } catch (error) {
       setNotice(`Gagal menghapus riwayat: ${String(error)}`);
     }
@@ -541,8 +541,8 @@ function App() {
                   <span className="confirm-icon">!</span>
                   <h3 id="confirm-clear-title">Hapus seluruh riwayat?</h3>
                   <p id="confirm-clear-desc">
-                    Riwayat konversi di aplikasi akan dihapus. File hasil di folder
-                    keluaran tidak ikut terhapus.
+                    Riwayat konversi dan semua file hasilnya akan dihapus dari
+                    folder keluaran. Tindakan ini tidak bisa dibatalkan.
                   </p>
                   <div className="confirm-actions">
                     <button className="browse" autoFocus onClick={() => setConfirmClear(false)}>

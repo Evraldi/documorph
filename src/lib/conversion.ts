@@ -34,7 +34,7 @@ export const conversionTabs: {
   {
     id: "office",
     label: "Office ↔ PDF",
-    description: "Konversi dokumen Word/Office ke dan dari PDF.",
+    description: "Konversi dokumen Word/Office ke PDF.",
   },
   {
     id: "markdown",
@@ -109,17 +109,15 @@ export function targetsForTab(
   const all = formatsFor(fileName, engines);
   const ext = fileName.split(".").pop()?.toLowerCase() || "";
   if (tab === "office") {
-    const officeInputs = ["doc", "docx", "odt", "rtf", "pdf"];
+    // PDF → DOCX hanya ditawarkan di Alat PDF supaya tidak dobel.
+    const officeInputs = ["doc", "docx", "odt", "rtf"];
     return officeInputs.includes(ext)
-      ? all.filter(
-          (target) =>
-            target === "PDF" || (ext === "pdf" && target === "DOCX"),
-        )
+      ? all.filter((target) => target === "PDF")
       : [];
   }
   if (tab === "markdown") return all.filter((target) => target === "Markdown");
   if (tab === "pdf") {
-    // PDF → DOCX juga alat PDF, bukan hanya Office. OCR butuh tiga engine.
+    // PDF → DOCX hanya di Alat PDF. OCR butuh tiga engine.
     return all.filter((target) =>
       ["DOCX", "Searchable PDF", "OCR Text"].includes(target),
     );
@@ -170,7 +168,7 @@ export function runnableQueue<T extends QueueItem>(items: T[]): T[] {
 }
 
 export function extensionsForTab(tab: ConversionTab): string[] {
-  if (tab === "office") return ["doc", "docx", "odt", "rtf", "pdf"];
+  if (tab === "office") return ["doc", "docx", "odt", "rtf"];
   if (tab === "markdown") {
     return [
       "pdf",

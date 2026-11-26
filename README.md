@@ -37,7 +37,6 @@ divalidasi ulang di backend sebelum proses dijalankan.
 | Tab | Input | Output | Engine | Tier |
 | --- | --- | --- | --- | --- |
 | Office ↔ PDF | DOC/DOCX/ODT/RTF | PDF | LibreOffice | A |
-| Office ↔ PDF | PDF | DOCX | PDF scan: Tesseract/OCRmyPDF + Pandoc; digital: pdf2docx → AnyMD + Pandoc → LibreOffice Draw+Writer | B/C |
 | Any → Markdown | PDF, Office, Markdown, HTML, TXT, EPUB, TeX, dll. | Markdown | AnyMD | B |
 | Alat PDF | PDF | DOCX | PDF scan: Tesseract/OCRmyPDF + Pandoc; digital: pdf2docx → AnyMD + Pandoc → LibreOffice Draw+Writer | B/C |
 | Alat PDF | PDF | Searchable PDF / OCR Text | OCRmyPDF + Tesseract + Ghostscript | B/C |
@@ -123,6 +122,11 @@ Tesseract + koreksi kata yang sama seperti Searchable PDF, dan sidecar OCRmyPDF
 terputar. Confidence rata-rata Tesseract memilih kandidat; pemilih ini cocok dengan
 ground truth 11/11 sample. PDF yang sudah punya text layer tetap memakai rute
 pdf2docx/AnyMD seperti sebelumnya.
+
+Teks yang dikirim ke Pandoc memakai bbox kata untuk memisahkan paragraf: celah
+vertikal besar menjadi `\n\n`, sementara baris dalam satu paragraf digabung
+dengan spasi. Kata-katanya tidak diubah, jadi CER/WER tetap sama; yang membaik
+adalah DOCX tidak lagi keluar sebagai satu paragraf panjang.
 
 Setiap koreksi kata dicatat dengan format `Halaman n: sebelum → sesudah (rule)`.
 Rute OCR bisa dikembalikan ke perilaku lama dengan:
@@ -254,6 +258,11 @@ Kandidat diperiksa dari lokasi eksplisit (bukan PATH): env var per engine
 - Pesan error engine dibersihkan: satu baris, terpotong, path internal disamarkan
   sebelum ditampilkan di UI.
 - Tombol **Hapus riwayat** butuh konfirmasi klik kedua; tidak ada `window.alert`.
+  Penghapusan juga menghapus semua file hasil yang masih tercatat di riwayat,
+  setelah pathnya divalidasi lewat `output_guard` (file asli di luar riwayat
+  tidak disentuh).
+- **PDF → DOCX** hanya ditawarkan di tab **Alat PDF**, bukan dobel di
+  **Office ↔ PDF**.
 
 ## Catatan produksi
 

@@ -97,6 +97,12 @@ test("PDF tools offers DOCX even without OCR engines", () => {
   assert.deepEqual(targetsForTab("scan.pdf", withoutDocxEngine, "pdf"), []);
 });
 
+test("PDF to DOCX lives only in Alat PDF, not in Office", () => {
+  assert.deepEqual(targetsForTab("scan.pdf", allEngines, "office"), []);
+  assert.equal(extensionsForTab("office").includes("pdf"), false);
+  assert.ok(targetsForTab("scan.pdf", allEngines, "pdf").includes("DOCX"));
+});
+
 test("OCR readiness separates the missing engine from installed ones", () => {
   const partial = { ...allEngines, ocrmypdf: false };
   assert.deepEqual(missingOcrEngines(partial), ["OCRmyPDF"]);

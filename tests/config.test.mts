@@ -267,6 +267,9 @@ test("history deletion uses a real confirmation dialog", () => {
   assert.match(app, /role="alertdialog"/);
   assert.match(app, /Ya, hapus riwayat/);
   assert.match(app, /confirm-clear-desc/);
+  assert.match(app, /semua file hasilnya akan dihapus/);
+  assert.match(app, /invoke<number>\("history_clear"\)/);
+  assert.match(read("src-tauri/src/lib.rs"), /fn clear_history\(conn: &Connection\)/);
 });
 
 test("completed conversions are visible without reading a status line", () => {

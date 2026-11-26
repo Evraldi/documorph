@@ -153,8 +153,7 @@ fn record_history(
     )
 }
 
-fn allowed_output_keys(app: &AppHandle) -> Result<Vec<String>, String> {
-    let conn = history_connection(app)?;
+fn allowed_output_keys(conn: &Connection) -> Result<Vec<String>, String> {
     let mut statement = conn
         .prepare("SELECT output FROM history")
         .map_err(|e| e.to_string())?;
@@ -171,7 +170,8 @@ fn allowed_output_keys(app: &AppHandle) -> Result<Vec<String>, String> {
 }
 
 fn ensure_output_path(app: &AppHandle, path: &Path) -> Result<(), String> {
-    let allowed = allowed_output_keys(app)?;
+    let conn = history_connection(app)?;
+    let allowed = allowed_output_keys(&conn)?;
     output_guard::validate(path, &allowed)
 }
 
@@ -215,12 +215,45 @@ fn list_history(conn: &Connection) -> Result<Vec<HistoryItem>, String> {
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn history_clear(app: AppHandle) -> Result<(), String> {
-    history_connection(&app)?
-        .execute("DELETE FROM history", [])
+/// Hapus semua keluaran yang masih tercatat, lalu kosongkan riwayat. Path tetap
+/// divalidasi lewat output_guard: hanya file hasil konversi kita yang disentuh.
+fn clear_history(conn: &Connection) -> Result<usize, String> {
+    let allowed = allowed_output_keys(conn)?;
+    let mut statement = conn
+        .prepare("SELECT output FROM history")
+        .map_err(|e| e.to_string())?;
+    let outputs: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    drop(statement);
+
+    let mut deleted = 0usize;
+    for raw in outputs {
+        let path = PathBuf::from(raw);
+        if output_guard::validate(&path, &allowed).is_err() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => deleted += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Gagal menghapus keluaran {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    conn.execute("DELETE FROM history", [])
         .map_err(|e| format!("Gagal menghapus riwayat: {e}"))?;
-    Ok(())
+    Ok(deleted)
+}
+
+#[tauri::command]
+fn history_clear(app: AppHandle) -> Result<usize, String> {
+    clear_history(&history_connection(&app)?)
 }
 
 #[tauri::command(async)]
@@ -733,6 +766,43 @@ fn pdf_docx_sidecar_postprocess_enabled() -> bool {
     !env_flag_disabled("DOCUMORPH_PDF_DOCX_SIDECAR_POSTPROCESS")
 }
 
+/// Susun teks Markdown untuk Pandoc. Baris yang berdekatan digabung dengan
+/// spasi, sedangkan celah vertikal besar (umpamanya antar paragraf, heading,
+/// atau butir) jadi `\n\n` supaya DOCX tidak keluar sebagai satu paragraf
+/// panjang. Token kata tidak diubah, jadi metrik CER/WER tetap sama.
+fn words_to_docx_text(words: &[ocr_postprocess::OcrWord]) -> String {
+    let mut heights: Vec<f32> = words.iter().map(|word| word.bbox.height as f32).collect();
+    heights.sort_by(f32::total_cmp);
+    let median_height = heights
+        .get(heights.len() / 2)
+        .copied()
+        .unwrap_or(10.0)
+        .max(1.0);
+
+    let mut output = String::new();
+    for (index, word) in words.iter().enumerate() {
+        output.push_str(&word.text);
+        let Some(next) = words.get(index + 1) else {
+            output.push('\n');
+            break;
+        };
+        if next.page != word.page {
+            output.push_str("\n\n");
+            continue;
+        }
+        let top = word.bbox.top.max(next.bbox.top);
+        let bottom = (word.bbox.top + word.bbox.height).min(next.bbox.top + next.bbox.height);
+        if bottom - top >= word.bbox.height.min(next.bbox.height) / 2 {
+            output.push(' ');
+        } else if (next.bbox.top - word.bbox.top - word.bbox.height) as f32 >= median_height * 1.2 {
+            output.push_str("\n\n");
+        } else {
+            output.push('\n');
+        }
+    }
+    output
+}
+
 /// Sidecar OCRmyPDF hanya berisi teks tanpa confidence dan bbox per kata.
 /// Word disintesis dengan confidence 95 supaya kamus hanya menjalankan koreksi
 /// eksplisit yang konservatif. Token `0`/`2` dikecualikan dari normalisasi
@@ -945,7 +1015,7 @@ fn choose_docx_ocr_text(
         if !direct_text.is_empty() {
             direct_text.push_str("\n\n");
         }
-        direct_text.push_str(&ocr_layer::words_to_text(&processed));
+        direct_text.push_str(&words_to_docx_text(&processed));
     }
 
     let sidecar = dir.join("ocrmypdf.txt");
@@ -1802,6 +1872,43 @@ mod tests {
     }
 
     #[test]
+    fn clearing_history_deletes_recorded_outputs_only() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        db::migrate(&conn).expect("migrate");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let docx = dir.path().join("laporan.docx");
+        let txt = dir.path().join("catatan.txt");
+        let payload = dir.path().join("payload.exe");
+        for path in [&docx, &txt, &payload] {
+            std::fs::write(path, b"keluaran").expect("tulis keluaran");
+        }
+        for (name, path) in [
+            ("laporan.docx", &docx),
+            ("catatan.txt", &txt),
+            ("payload.exe", &payload),
+        ] {
+            insert_history_record(
+                &conn,
+                &HistoryItem {
+                    name: name.into(),
+                    output: path.to_string_lossy().into_owned(),
+                    engine: "Pandoc".into(),
+                    tier: "B".into(),
+                    at: 1234,
+                    warnings: Vec::new(),
+                },
+            )
+            .expect("insert");
+        }
+
+        assert_eq!(clear_history(&conn).expect("clear"), 2);
+        assert!(!docx.exists());
+        assert!(!txt.exists());
+        assert!(payload.exists());
+        assert!(list_history(&conn).expect("list").is_empty());
+    }
+
+    #[test]
     fn explorer_arguments_accept_only_supported_documents() {
         let dir = std::env::temp_dir().join(format!("documorph-open-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -2045,7 +2152,7 @@ mod tests {
             if !combined.is_empty() {
                 combined.push_str("\n\n");
             }
-            combined.push_str(&ocr_layer::words_to_text(&processed));
+            combined.push_str(&words_to_docx_text(&processed));
         }
 
         let mean = confidence_total / confidence_words.max(1) as f32;
@@ -2332,6 +2439,36 @@ mod tests {
     }
 
     #[test]
+    fn docx_text_marks_paragraph_gaps_without_touching_words() {
+        let word = |top: i32, text: &str| ocr_postprocess::OcrWord {
+            page: 1,
+            block: 0,
+            paragraph: 0,
+            line: top as usize,
+            word: 0,
+            bbox: ocr_postprocess::BBox {
+                left: 0,
+                top,
+                width: 100,
+                height: 20,
+            },
+            text: text.to_string(),
+            confidence: 95.0,
+        };
+        let words = vec![
+            word(0, "Satu"),
+            word(0, "baris"),
+            word(40, "lanjutan"),
+            word(100, "Paragraf"),
+            word(100, "baru"),
+        ];
+        assert_eq!(
+            words_to_docx_text(&words),
+            "Satu baris\nlanjutan\n\nParagraf baru\n"
+        );
+    }
+
+    #[test]
     fn sidecar_postprocess_keeps_numeric_table_cells() {
         let config = ocr_postprocess::PostprocessConfig::from_env();
         assert_eq!(
@@ -2439,8 +2576,12 @@ mod tests {
             let (docx_text, tables, rows, cells, images) = diag_docx_summary(&docx);
             let docx_cer = ocr_metrics::cer(&document.reference, &docx_text);
             let docx_cer_ref = ocr_metrics::cer_reference(&document.reference, &docx_text);
+            let paragraphs = docx_text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
             println!(
-                "{:<20} engine={engine:<18} CER={cer:.4}/{cer_ref:.4} DOCX={docx_cer:.4}/{docx_cer_ref:.4} batas={max_cer:.4}/{max_cer_ref:.4} tbl={tables}/{rows}/{cells} img={images}",
+                "{:<20} engine={engine:<18} CER={cer:.4}/{cer_ref:.4} DOCX={docx_cer:.4}/{docx_cer_ref:.4} batas={max_cer:.4}/{max_cer_ref:.4} par={paragraphs} tbl={tables}/{rows}/{cells} img={images}",
                 document.name
             );
             assert!(
@@ -2464,6 +2605,11 @@ mod tests {
                 document.name
             );
             if document.name == "image-only-no-text" {
+                assert!(
+                    paragraphs >= 8,
+                    "{}: DOCX hanya punya {paragraphs} paragraf",
+                    document.name
+                );
                 for token in ["Sequencer", "function", "is", "3½"] {
                     assert!(
                         docx_text.contains(token),
