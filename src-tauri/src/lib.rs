@@ -766,10 +766,16 @@ fn pdf_docx_sidecar_postprocess_enabled() -> bool {
     !env_flag_disabled("DOCUMORPH_PDF_DOCX_SIDECAR_POSTPROCESS")
 }
 
+fn vertically_overlaps(a: &ocr_postprocess::OcrWord, b: &ocr_postprocess::OcrWord) -> bool {
+    let top = a.bbox.top.max(b.bbox.top);
+    let bottom = (a.bbox.top + a.bbox.height).min(b.bbox.top + b.bbox.height);
+    bottom - top >= a.bbox.height.min(b.bbox.height) / 2
+}
+
 /// Susun teks Markdown untuk Pandoc. Baris yang berdekatan digabung dengan
-/// spasi, sedangkan celah vertikal besar (umpamanya antar paragraf, heading,
-/// atau butir) jadi `\n\n` supaya DOCX tidak keluar sebagai satu paragraf
-/// panjang. Token kata tidak diubah, jadi metrik CER/WER tetap sama.
+/// spasi, celah vertikal besar jadi `\n\n`, dan setiap marker bullet di awal
+/// baris OCR memulai paragraf sendiri. Aturannya generik untuk dokumen scan,
+/// bukan kata tertentu. Token kata tidak diubah, jadi metrik CER/WER tetap sama.
 fn words_to_docx_text(words: &[ocr_postprocess::OcrWord]) -> String {
     let mut heights: Vec<f32> = words.iter().map(|word| word.bbox.height as f32).collect();
     heights.sort_by(f32::total_cmp);
@@ -780,26 +786,25 @@ fn words_to_docx_text(words: &[ocr_postprocess::OcrWord]) -> String {
         .max(1.0);
 
     let mut output = String::new();
-    for (index, word) in words.iter().enumerate() {
+    let mut previous: Option<&ocr_postprocess::OcrWord> = None;
+    for word in words {
+        if let Some(prev) = previous {
+            if (word.text == "•" && !vertically_overlaps(prev, word)) || word.page != prev.page {
+                output.push_str("\n\n");
+            } else if vertically_overlaps(prev, word) {
+                output.push(' ');
+            } else if (word.bbox.top - prev.bbox.top - prev.bbox.height) as f32
+                >= median_height * 1.2
+            {
+                output.push_str("\n\n");
+            } else {
+                output.push('\n');
+            }
+        }
         output.push_str(&word.text);
-        let Some(next) = words.get(index + 1) else {
-            output.push('\n');
-            break;
-        };
-        if next.page != word.page {
-            output.push_str("\n\n");
-            continue;
-        }
-        let top = word.bbox.top.max(next.bbox.top);
-        let bottom = (word.bbox.top + word.bbox.height).min(next.bbox.top + next.bbox.height);
-        if bottom - top >= word.bbox.height.min(next.bbox.height) / 2 {
-            output.push(' ');
-        } else if (next.bbox.top - word.bbox.top - word.bbox.height) as f32 >= median_height * 1.2 {
-            output.push_str("\n\n");
-        } else {
-            output.push('\n');
-        }
+        previous = Some(word);
     }
+    output.push('\n');
     output
 }
 
@@ -823,13 +828,15 @@ fn postprocess_sidecar_text(text: &str, config: &ocr_postprocess::PostprocessCon
         }
         first_page = false;
         let mut first_line = true;
+        let mut previous_blank = false;
         for (line_index, line) in page_text.lines().enumerate() {
-            if !first_line {
-                output.push('\n');
-            }
-            first_line = false;
             let tokens: Vec<String> = line.split_whitespace().map(str::to_string).collect();
             if tokens.is_empty() {
+                if !first_line {
+                    output.push('\n');
+                }
+                first_line = false;
+                previous_blank = true;
                 continue;
             }
             let words: Vec<ocr_postprocess::OcrWord> = tokens
@@ -869,17 +876,25 @@ fn postprocess_sidecar_text(text: &str, config: &ocr_postprocess::PostprocessCon
                     correction.page, correction.before, correction.after, correction.rule
                 );
             }
-            output.push_str(
-                &processed
-                    .iter()
-                    .map(|word| match word.text.as_str() {
-                        "\u{E000}" => "0",
-                        "\u{E001}" => "2",
-                        other => other,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
+            let line_text = processed
+                .iter()
+                .map(|word| match word.text.as_str() {
+                    "\u{E000}" => "0",
+                    "\u{E001}" => "2",
+                    other => other,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !first_line {
+                if processed.first().is_some_and(|word| word.text == "•") && !previous_blank {
+                    output.push_str("\n\n");
+                } else {
+                    output.push('\n');
+                }
+            }
+            first_line = false;
+            previous_blank = false;
+            output.push_str(&line_text);
         }
     }
     output
@@ -2469,6 +2484,34 @@ mod tests {
     }
 
     #[test]
+    fn docx_text_starts_each_bullet_item_in_own_paragraph() {
+        let word = |top: i32, text: &str| ocr_postprocess::OcrWord {
+            page: 1,
+            block: 0,
+            paragraph: 0,
+            line: top as usize,
+            word: 0,
+            bbox: ocr_postprocess::BBox {
+                left: 0,
+                top,
+                width: 100,
+                height: 20,
+            },
+            text: text.to_string(),
+            confidence: 95.0,
+        };
+        let words = vec![
+            word(0, "•"),
+            word(0, "Satu"),
+            word(0, "item"),
+            word(40, "•"),
+            word(40, "Dua"),
+            word(40, "item"),
+        ];
+        assert_eq!(words_to_docx_text(&words), "• Satu item\n\n• Dua item\n");
+    }
+
+    #[test]
     fn sidecar_postprocess_keeps_numeric_table_cells() {
         let config = ocr_postprocess::PostprocessConfig::from_env();
         assert_eq!(
@@ -2487,6 +2530,24 @@ mod tests {
         assert_eq!(
             postprocess_sidecar_text("disk drive 312”", &config),
             "disk drive 3½″"
+        );
+    }
+
+    #[test]
+    fn sidecar_postprocess_starts_each_bullet_line_in_own_paragraph() {
+        let config = ocr_postprocess::PostprocessConfig::from_env();
+        assert_eq!(
+            postprocess_sidecar_text("© Satu\n© Dua\nlanjutan", &config),
+            "• Satu\n\n• Dua\nlanjutan"
+        );
+    }
+
+    #[test]
+    fn sidecar_postprocess_preserves_blank_lines_between_paragraphs() {
+        let config = ocr_postprocess::PostprocessConfig::from_env();
+        assert_eq!(
+            postprocess_sidecar_text("Satu\n\nDua", &config),
+            "Satu\n\nDua"
         );
     }
 
@@ -2606,7 +2667,7 @@ mod tests {
             );
             if document.name == "image-only-no-text" {
                 assert!(
-                    paragraphs >= 8,
+                    paragraphs >= 20,
                     "{}: DOCX hanya punya {paragraphs} paragraf",
                     document.name
                 );

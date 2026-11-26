@@ -125,8 +125,10 @@ pdf2docx/AnyMD seperti sebelumnya.
 
 Teks yang dikirim ke Pandoc memakai bbox kata untuk memisahkan paragraf: celah
 vertikal besar menjadi `\n\n`, sementara baris dalam satu paragraf digabung
-dengan spasi. Kata-katanya tidak diubah, jadi CER/WER tetap sama; yang membaik
-adalah DOCX tidak lagi keluar sebagai satu paragraf panjang.
+dengan spasi. Marker bullet (`•`) di awal baris OCR juga memulai paragraf
+sendiri, sehingga daftar tidak numpuk jadi satu blok. Aturannya generik untuk
+dokumen scan, bukan kata tertentu. Kata-katanya tidak diubah, jadi CER/WER tetap
+sama; yang membaik adalah DOCX tidak lagi keluar sebagai satu paragraf panjang.
 
 Setiap koreksi kata dicatat dengan format `Halaman n: sebelum → sesudah (rule)`.
 Rute OCR bisa dikembalikan ke perilaku lama dengan:

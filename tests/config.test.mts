@@ -312,7 +312,10 @@ test("PDF to Writer documents uses real engine routes", () => {
   assert.equal(lib.includes('arg("-d").arg(&output)'), false);
   assert.match(lib, /fn pdf_writer_route/);
   assert.match(lib, /--infilter=HTML \(StarWriter\)/);
+  assert.match(lib, /fn words_to_docx_text/);
+  assert.match(lib, /word\.text == "•" && !vertically_overlaps/);
   assert.match(readme, /LibreOffice Draw → Writer/);
+  assert.match(readme, /Marker bullet/);
 });
 
 test("searchable PDF rewrites an invisible word layer after correction", () => {
