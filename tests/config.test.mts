@@ -329,11 +329,16 @@ test("searchable PDF rewrites an invisible word layer after correction", () => {
   assert.match(layer, /word_separator/);
   assert.match(layer, /pdftotext/);
   assert.match(layer, /pymupdf/);
+  assert.match(layer, /DOCUMORPH_OCR_RAW_BGR/);
   assert.match(layer, /sample_image_only_pdf_gets_correct_invisible_text_layer/);
   assert.match(postprocess, /DOCUMORPH_OCR_POSTPROCESS/);
   for (const flag of [
     "DOCUMORPH_OCR_ROTATION",
     "DOCUMORPH_OCR_DICTIONARY",
+    "DOCUMORPH_OCR_FONT_RERUN",
+    "DOCUMORPH_OCR_FONT_RERUN_SKIP_SAFE",
+    "DOCUMORPH_OCR_PARALLEL_PAGES",
+    "DOCUMORPH_OCR_PARALLEL_FONT_RERUN",
     "DOCUMORPH_OCR_LAYOUT",
     "DOCUMORPH_OCR_BULLET",
     "DOCUMORPH_OCR_HYPHEN",

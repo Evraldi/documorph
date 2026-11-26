@@ -227,7 +227,11 @@ impl Tesseract {
     /// tegak, plus confidence-nya.
     fn orientation(&self, image: &PageImage, temp: &Path) -> Option<(u32, f32)> {
         let input = temp.join("orientation.ppm");
-        image.osd_thumbnail().write_ppm(&input).ok()?;
+        let thumbnail = image.osd_thumbnail();
+        if timing_enabled() {
+            println!("[osd] thumb={}x{}", thumbnail.width, thumbnail.height);
+        }
+        thumbnail.write_ppm(&input).ok()?;
         let mut command = Command::new(&self.executable);
         hide_console(&mut command);
         let output = command
@@ -257,6 +261,9 @@ impl Tesseract {
             return None;
         }
         let confidence = confidence.unwrap_or(0.0);
+        if timing_enabled() {
+            println!("[osd] result={degrees}° conf={confidence:.2}");
+        }
         (confidence >= OSD_MIN_CONFIDENCE).then_some((degrees, confidence))
     }
 }
@@ -362,10 +369,21 @@ struct CropRefiner {
     temp: PathBuf,
     refine_calls: AtomicUsize,
     refine_millis: AtomicU64,
+    /// ID unik per pemanggilan, supaya worker paralel tidak menimpa file PPM.
+    refine_seq: AtomicU64,
 }
 
 fn timing_enabled() -> bool {
     std::env::var("DOCUMORPH_TIMING").is_ok()
+}
+
+/// Pdfium bisa merender langsung 3 channel RGB (format BGR + reverse byte
+/// order). Aktif by default; `0`/`false`/`no`/`off` kembali ke jalur RGBA lama.
+fn raw_bgr_enabled() -> bool {
+    match std::env::var("DOCUMORPH_OCR_RAW_BGR") {
+        Ok(value) => !matches!(value.to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
 }
 
 fn print_timing(label: &str, duration: std::time::Duration) {
@@ -379,9 +397,12 @@ impl WordRefiner for CropRefiner {
         let started = Instant::now();
         let result = (|| {
             let image = self.images.get(&page)?.crop_upscaled(bbox, upscale)?;
+            let seq = self.refine_seq.fetch_add(1, Ordering::Relaxed);
+            let job_dir = self.temp.join(format!("refine-{page}-{seq}"));
+            fs::create_dir_all(&job_dir).ok()?;
             let tsv = self
                 .tesseract
-                .run(&image, TESSERACT_PSM_WORD, &self.temp)
+                .run(&image, TESSERACT_PSM_WORD, &job_dir.join("word"))
                 .ok()?;
             let candidates = parse_tsv(&tsv, page);
             let best = candidates
@@ -429,6 +450,11 @@ pub fn rewrite_searchable_layer(
     let mut convert_total = 0.0f32;
     let mut osd_total = 0.0f32;
     let mut ocr_total = 0.0f32;
+    let raw_bgr = raw_bgr_enabled();
+
+    // Fase 1: render + OSD tetap sequential. Pdfium dan file PPM OSD memakai
+    // satu direktori kerja.
+    let mut page_images: Vec<(usize, PageImage)> = Vec::with_capacity(page_count);
     for index in 0..page_count {
         if cancel.load(Ordering::SeqCst) {
             return Err("Konversi dibatalkan.".into());
@@ -443,15 +469,40 @@ pub fn rewrite_searchable_layer(
         let target_width = ((page_width / 72.0) * dpi as f32).round().max(1.0) as usize;
         let target_height = ((page_height / 72.0) * dpi as f32).round().max(1.0) as usize;
         let started = Instant::now();
+        let mut render_config =
+            PdfRenderConfig::new().set_target_size(target_width as i32, target_height as i32);
+        if raw_bgr {
+            render_config = render_config
+                .set_format(PdfBitmapFormat::BGR)
+                .set_reverse_byte_order(true);
+        }
         let bitmap = page
-            .render_with_config(
-                &PdfRenderConfig::new().set_target_size(target_width as i32, target_height as i32),
-            )
+            .render_with_config(&render_config)
             .map_err(|error| format!("Gagal merender halaman {}: {error}", index + 1))?;
         render_total += started.elapsed().as_secs_f32();
         let started = Instant::now();
-        let rgba = bitmap.as_rgba_bytes();
-        let image = PageImage::from_rgba(target_width, target_height, &rgba);
+        let image = if raw_bgr {
+            // Buffer mentah sudah RGB 3-byte; tiap baris bisa punya padding
+            // sampai kelipatan 4 byte, jadi salin hanya `width * 3` byte.
+            let raw = bitmap.as_raw_bytes();
+            let stride = raw.len() / target_height.max(1);
+            let row_bytes = target_width * 3;
+            if stride >= row_bytes && raw.len() >= stride * target_height {
+                let mut rgb = Vec::with_capacity(row_bytes * target_height);
+                for row in raw.chunks_exact(stride) {
+                    rgb.extend_from_slice(&row[..row_bytes]);
+                }
+                PageImage {
+                    width: target_width,
+                    height: target_height,
+                    rgb,
+                }
+            } else {
+                PageImage::from_rgba(target_width, target_height, &bitmap.as_rgba_bytes())
+            }
+        } else {
+            PageImage::from_rgba(target_width, target_height, &bitmap.as_rgba_bytes())
+        };
         convert_total += started.elapsed().as_secs_f32();
         let started = Instant::now();
         let (image, rotation) = orient_page(
@@ -466,12 +517,81 @@ pub fn rewrite_searchable_layer(
         if let Some(rotation) = rotation {
             rotations.insert(index + 1, rotation);
         }
-        let started = Instant::now();
-        let tsv = tesseract.run(&image, TESSERACT_PSM_PAGE, temp_dir)?;
-        ocr_total += started.elapsed().as_secs_f32();
-        words.extend(parse_tsv(&tsv, index + 1));
-        images.insert(index + 1, image);
+        page_images.push((index + 1, image));
     }
+
+    // Fase 2: OCR halaman. Eksperimen paralel memakai worker thread; tiap
+    // worker punya subdirectory sendiri supaya file PPM tidak saling timpa.
+    let started = Instant::now();
+    if config.parallel_pages {
+        // Batasi worker supaya tidak menumpuk banyak gambar 82 MP di memory.
+        let huge_page = page_images
+            .iter()
+            .any(|(_, image)| image.width.saturating_mul(image.height) > 40_000_000);
+        let workers = if huge_page {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1)
+                .clamp(1, 4)
+        };
+        let mut chunks: Vec<Vec<(usize, PageImage)>> = vec![Vec::new(); workers];
+        for (index, item) in page_images.into_iter().enumerate() {
+            chunks[index % workers].push(item);
+        }
+        let mut results = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .filter(|chunk| !chunk.is_empty())
+                .map(|chunk| {
+                    let executable = tesseract.executable.clone();
+                    let language = tesseract.language.clone();
+                    scope.spawn(move || -> Result<Vec<(usize, String, PageImage)>, String> {
+                        let mut results = Vec::with_capacity(chunk.len());
+                        for (page, image) in chunk {
+                            if cancel.load(Ordering::SeqCst) {
+                                return Err("Konversi dibatalkan.".to_string());
+                            }
+                            let job_dir = temp_dir.join(format!("ocr-page-{page}"));
+                            fs::create_dir_all(&job_dir)
+                                .map_err(|error| format!("Gagal membuat direktori OCR: {error}"))?;
+                            let stem = job_dir.join("page");
+                            let engine = Tesseract::new(executable.clone(), language.clone());
+                            let tsv = engine.run(&image, TESSERACT_PSM_PAGE, &stem)?;
+                            results.push((page, tsv, image));
+                        }
+                        Ok(results)
+                    })
+                })
+                .collect();
+            let mut results = Vec::new();
+            for handle in handles {
+                results.extend(
+                    handle
+                        .join()
+                        .map_err(|_| "Worker OCR panik.".to_string())??,
+                );
+            }
+            Ok::<Vec<(usize, String, PageImage)>, String>(results)
+        })?;
+        // Urutan kata wajib mengikuti halaman, bukan urutan worker selesai.
+        results.sort_by_key(|(page, _, _)| *page);
+        for (page, tsv, image) in results {
+            words.extend(parse_tsv(&tsv, page));
+            images.insert(page, image);
+        }
+    } else {
+        for (page, image) in page_images {
+            let job_dir = temp_dir.join(format!("ocr-page-{page}"));
+            fs::create_dir_all(&job_dir)
+                .map_err(|error| format!("Gagal membuat direktori OCR: {error}"))?;
+            let tsv = tesseract.run(&image, TESSERACT_PSM_PAGE, &job_dir.join("page"))?;
+            words.extend(parse_tsv(&tsv, page));
+            images.insert(page, image);
+        }
+    }
+    ocr_total += started.elapsed().as_secs_f32();
     if timing_enabled() {
         println!(
             "[timing] render={render_total:.2}s rgba->rgb={convert_total:.2}s osd={osd_total:.2}s ocr-full={ocr_total:.2}s"
@@ -484,6 +604,7 @@ pub fn rewrite_searchable_layer(
         temp: temp_dir.to_path_buf(),
         refine_calls: AtomicUsize::new(0),
         refine_millis: AtomicU64::new(0),
+        refine_seq: AtomicU64::new(0),
     };
     let started = Instant::now();
     let (words, postprocess_corrections) = postprocess(words, config, Some(&refiner));
@@ -1231,6 +1352,7 @@ mod tests {
             temp: temp.path().to_path_buf(),
             refine_calls: AtomicUsize::new(0),
             refine_millis: AtomicU64::new(0),
+            refine_seq: AtomicU64::new(0),
         };
         let (_, corrections, stages) = postprocess_stages(raw_words, &config, Some(&refiner));
         let mut previous_body = ocr_metrics::cer(
@@ -1265,7 +1387,7 @@ mod tests {
     fn cross_document_metrics_do_not_regress_any_stage() {
         let pdfium = pdfium_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = PostprocessConfig::default();
+        let config = PostprocessConfig::from_env();
         let dpi = config.render_dpi.max(300);
         let filter = std::env::var("DOCUMORPH_CROSS_FILTER").unwrap_or_default();
 
@@ -1323,6 +1445,7 @@ mod tests {
                 temp: temp.path().to_path_buf(),
                 refine_calls: AtomicUsize::new(0),
                 refine_millis: AtomicU64::new(0),
+                refine_seq: AtomicU64::new(0),
             };
             let (final_words, corrections, stages) =
                 postprocess_stages(words, &config, Some(&refiner));
@@ -1466,7 +1589,7 @@ mod tests {
         assert!(!paths.is_empty(), "DOCUMORPH_REAL_SCANS kosong");
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = PostprocessConfig::default();
+        let config = PostprocessConfig::from_env();
         let cancel = AtomicBool::new(false);
         println!(
             "{:<28} {:>5} {:>9} {:>11} {:>7} {:>9}",
@@ -1551,6 +1674,157 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// OCR ulang judul paralel harus menghasilkan teks dan log koreksi yang
+    /// persis sama dengan jalur sequential.
+    #[test]
+    #[ignore = "butuh Tesseract + PDF sample nyata"]
+    fn parallel_font_rerun_matches_sequential() {
+        let pdfium = pdfium_for_test();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut results = Vec::new();
+        for (label, parallel) in [("sequential", false), ("parallel", true)] {
+            let target = temp.path().join(format!("{label}.pdf"));
+            fs::copy(sample_pdf_path(), &target).expect("copy sample");
+            let config = PostprocessConfig {
+                parallel_font_rerun: parallel,
+                ..PostprocessConfig::default()
+            };
+            let rewrite = rewrite_searchable_layer(
+                &pdfium,
+                &target,
+                Tesseract::new(tesseract_path(), "eng".to_string()),
+                &config,
+                &AtomicBool::new(false),
+                temp.path(),
+            )
+            .unwrap_or_else(|error| panic!("rewrite {label}: {error}"));
+            let document = pdfium
+                .load_pdf_from_file(&target, None)
+                .unwrap_or_else(|error| panic!("buka {label}: {error}"));
+            let page = document.pages().get(0).expect("halaman");
+            let text = page.text().expect("teks").all();
+            println!(
+                "{label}: {} kata, {} koreksi",
+                rewrite.word_count,
+                rewrite.corrections.len()
+            );
+            results.push((text, rewrite.corrections));
+        }
+        assert_eq!(
+            results[0].0, results[1].0,
+            "teks font-rerun paralel berbeda"
+        );
+        assert_eq!(
+            results[0].1, results[1].1,
+            "log koreksi font-rerun paralel berbeda"
+        );
+    }
+
+    /// OCR paralel per halaman harus menghasilkan teks yang persis sama
+    /// dengan jalur sequential. `DOCUMORPH_MULTIPAGE_PDF` bisa dipakai untuk
+    /// sample lain.
+    #[test]
+    #[ignore = "butuh Tesseract + PDF multipage nyata"]
+    fn parallel_pages_matches_sequential_text() {
+        let pdfium = pdfium_for_test();
+        let source = std::env::var("DOCUMORPH_MULTIPAGE_PDF").unwrap_or_else(|_| {
+            r"C:\Users\Evraldi\AppData\Local\Temp\opencode\multipage-skew-4.pdf".to_string()
+        });
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut texts = Vec::new();
+        for (label, parallel) in [("sequential", false), ("parallel", true)] {
+            let target = temp.path().join(format!("{label}.pdf"));
+            fs::copy(&source, &target).expect("copy sample");
+            let config = PostprocessConfig {
+                parallel_pages: parallel,
+                ..PostprocessConfig::default()
+            };
+            let rewrite = rewrite_searchable_layer(
+                &pdfium,
+                &target,
+                Tesseract::new(tesseract_path(), "ind+eng".to_string()),
+                &config,
+                &AtomicBool::new(false),
+                temp.path(),
+            )
+            .unwrap_or_else(|error| panic!("rewrite {label}: {error}"));
+            let document = pdfium
+                .load_pdf_from_file(&target, None)
+                .unwrap_or_else(|error| panic!("buka {label}: {error}"));
+            let mut text = String::new();
+            for page_index in 0..document.pages().len() {
+                let page = document.pages().get(page_index).expect("halaman");
+                text.push_str(&page.text().expect("teks").all());
+                text.push('\n');
+            }
+            println!(
+                "{label}: {} halaman, {} kata, {} koreksi",
+                rewrite.page_count,
+                rewrite.word_count,
+                rewrite.corrections.len()
+            );
+            texts.push(text);
+        }
+        assert_eq!(texts[0], texts[1], "teks parallel berbeda dari sequential");
+    }
+
+    /// Diagnosa: render BGR 3-channel + reverse byte order, lalu buang padding
+    /// baris, harus menghasilkan byte RGB identik dengan jalur RGBA lama.
+    #[test]
+    #[ignore = "butuh PDF sample nyata"]
+    fn raw_bgr_render_matches_rgba_path() {
+        let pdfium = pdfium_for_test();
+        let document = pdfium
+            .load_pdf_from_file(&sample_pdf_path(), None)
+            .expect("buka sample");
+        let page = document.pages().get(0).expect("halaman");
+        let width = refiner_width(&page, 300) as i32;
+        let height = refiner_height(&page, 300) as i32;
+
+        let started = Instant::now();
+        let old_bitmap = page
+            .render_with_config(&PdfRenderConfig::new().set_target_size(width, height))
+            .expect("render rgba");
+        let old_rgba = old_bitmap.as_rgba_bytes();
+        let old = PageImage::from_rgba(width as usize, height as usize, &old_rgba);
+        let old_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        let new_bitmap = page
+            .render_with_config(
+                &PdfRenderConfig::new()
+                    .set_format(PdfBitmapFormat::BGR)
+                    .set_target_size(width, height),
+            )
+            .expect("render bgr");
+        let raw = new_bitmap.as_raw_bytes();
+        let stride = raw.len() / height as usize;
+        let row_bytes = width as usize * 3;
+        let mut rgb = Vec::with_capacity(row_bytes * height as usize);
+        for row in raw.chunks_exact(stride) {
+            rgb.extend_from_slice(&row[..row_bytes]);
+        }
+        let new_elapsed = started.elapsed();
+        let new = PageImage {
+            width: width as usize,
+            height: height as usize,
+            rgb,
+        };
+
+        println!(
+            "rgba: {} byte, {:.2}s | bgr: {} byte (stride {}), {:.2}s",
+            old_rgba.len(),
+            old_elapsed.as_secs_f32(),
+            raw.len(),
+            stride,
+            new_elapsed.as_secs_f32()
+        );
+        assert_eq!(new.rgb.len(), old.rgb.len());
+        assert_eq!(new.rgb, old.rgb, "byte RGB berbeda dari jalur RGBA");
+        assert_eq!(new.width, old.width);
+        assert_eq!(new.height, old.height);
     }
 
     /// Diagnosa trade-off skala render: page box 96 DPI (82 MP), piksel native

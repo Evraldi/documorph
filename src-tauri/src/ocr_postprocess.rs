@@ -18,6 +18,11 @@ pub const DEFAULT_RENDER_DPI: u32 = 300;
 const DICTIONARY_CONFIDENCE: f32 = 96.0;
 /// Token dengan confidence di atas nilai ini tidak boleh dikoreksi kamus.
 const MAX_CORRECTABLE_CONFIDENCE: f32 = 90.0;
+
+/// Kata yang sudah di atas batas koreksi dan termasuk kata umum/merek/angka
+/// tidak perlu di-OCR ulang pada 600 DPI. Aktif by default; bisa dimatikan
+/// lewat `DOCUMORPH_OCR_FONT_RERUN_SKIP_SAFE=0` bila perlu rollback.
+const SAFE_RERUN_CONFIDENCE: f32 = 90.0;
 /// Sebuah kandidat harus muncul sekian kali sebagai kata benar.
 const MIN_CANDIDATE_FREQUENCY: usize = 3;
 /// Pola salah baca yang sudah pasti dan tidak boleh kena aturan umum kamus.
@@ -364,6 +369,10 @@ pub struct PostprocessConfig {
     pub min_confidence_gain: f32,
     pub max_reruns_per_page: usize,
     pub dictionary_pass: bool,
+    pub font_rerun_pass: bool,
+    pub font_rerun_skip_safe: bool,
+    pub parallel_font_rerun: bool,
+    pub parallel_pages: bool,
     pub layout_pass: bool,
     pub bullet_pass: bool,
     pub hyphen_pass: bool,
@@ -382,6 +391,10 @@ impl Default for PostprocessConfig {
             min_confidence_gain: 0.5,
             max_reruns_per_page: 24,
             dictionary_pass: true,
+            font_rerun_pass: true,
+            font_rerun_skip_safe: true,
+            parallel_font_rerun: true,
+            parallel_pages: true,
             layout_pass: true,
             bullet_pass: true,
             hyphen_pass: true,
@@ -399,6 +412,10 @@ impl PostprocessConfig {
         config.enabled = env_flag("DOCUMORPH_OCR_POSTPROCESS", true);
         config.rotation_pass = env_flag("DOCUMORPH_OCR_ROTATION", true);
         config.dictionary_pass = env_flag("DOCUMORPH_OCR_DICTIONARY", true);
+        config.font_rerun_pass = env_flag("DOCUMORPH_OCR_FONT_RERUN", true);
+        config.font_rerun_skip_safe = env_flag("DOCUMORPH_OCR_FONT_RERUN_SKIP_SAFE", true);
+        config.parallel_font_rerun = env_flag("DOCUMORPH_OCR_PARALLEL_FONT_RERUN", true);
+        config.parallel_pages = env_flag("DOCUMORPH_OCR_PARALLEL_PAGES", true);
         config.layout_pass = env_flag("DOCUMORPH_OCR_LAYOUT", true);
         config.bullet_pass = env_flag("DOCUMORPH_OCR_BULLET", true);
         config.hyphen_pass = env_flag("DOCUMORPH_OCR_HYPHEN", true);
@@ -436,7 +453,7 @@ fn env_u32(name: &str, default: u32) -> u32 {
 
 /// Implementasi OCR ulang pada crop kata. Dipakai hanya untuk heading/font
 /// besar outlier; body text tetap memakai hasil render 300 DPI apa adanya.
-pub trait WordRefiner {
+pub trait WordRefiner: Sync {
     fn refine(&self, page: usize, bbox: &BBox, upscale: u32) -> Option<(String, f32)>;
 }
 
@@ -490,10 +507,12 @@ fn apply_passes(
     };
 
     snapshot("ocr-mentah", &words);
-    if let Some(refiner) = refiner {
+    if config.font_rerun_pass
+        && let Some(refiner) = refiner
+    {
         rerun_large_font_words(&mut words, config, refiner, &mut log);
-        snapshot("ocr-ulang-judul", &words);
     }
+    snapshot("ocr-ulang-judul", &words);
     if config.fraction_pass {
         normalize_fractions(&mut words, &mut log);
         snapshot("pecahan", &words);
@@ -553,7 +572,16 @@ fn rerun_large_font_words(
     refiner: &dyn WordRefiner,
     log: &mut Vec<Correction>,
 ) {
+    let extra: HashSet<String> = config
+        .dictionary_extra
+        .iter()
+        .map(String::as_str)
+        .map(word_key)
+        .collect();
     let pages: HashSet<usize> = words.iter().map(|word| word.page).collect();
+    // Kumpulkan dulu semua kandidat. Seleksi hanya bergantung pada state awal
+    // `words`, sehingga paralelisasi OCR ulang tidak mengubah keputusan.
+    let mut tasks: Vec<(usize, usize, BBox, u32)> = Vec::new();
     for page in pages {
         let mut heights: Vec<f32> = words
             .iter()
@@ -576,7 +604,11 @@ fn rerun_large_font_words(
             })
             .collect();
         let mut attempts = 0usize;
-        for word in words.iter_mut().filter(|word| word.page == page) {
+        for (index, word) in words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| word.page == page)
+        {
             if attempts >= config.max_reruns_per_page {
                 break;
             }
@@ -587,31 +619,97 @@ fn rerun_large_font_words(
                 continue;
             }
             attempts += 1;
+            if config.font_rerun_skip_safe
+                && word.confidence >= SAFE_RERUN_CONFIDENCE
+                && is_whitelisted(&word.text, &extra)
+            {
+                if std::env::var("DOCUMORPH_TIMING").is_ok() {
+                    println!(
+                        "[font-rerun-skip] hal={} {:?} conf={:.2}",
+                        word.page, word.text, word.confidence
+                    );
+                }
+                continue;
+            }
+            if std::env::var("DOCUMORPH_TIMING").is_ok() {
+                println!(
+                    "[font-rerun] hal={} {:?} conf={:.2}",
+                    word.page, word.text, word.confidence
+                );
+            }
             let upscale = (config.rerender_dpi / config.render_dpi.max(1)).max(2);
-            let Some((candidate, confidence)) = refiner.refine(word.page, &word.bbox, upscale)
-            else {
-                continue;
-            };
-            let candidate = candidate.trim().to_string();
-            if candidate.is_empty() || candidate == word.text {
-                continue;
-            }
-            // Crop judul boleh di-upscale, tapi kandidat yang jauh lebih pendek
-            // hampir selalu potongan bbox (mis. `LinnSequencer` → `e`), bukan
-            // koreksi. Batasi penyusutan paling banyak satu karakter.
-            let before_len = word.text.chars().count();
-            let after_len = candidate.chars().count();
-            if after_len < 2 || after_len + 1 < before_len {
-                continue;
-            }
-            if confidence <= word.confidence + config.min_confidence_gain {
-                continue;
-            }
-            let before = word.text.clone();
-            word.text = candidate;
-            word.confidence = confidence;
-            push_log(log, word, &before, &word.text, "large-font-rerun");
+            tasks.push((index, word.page, word.bbox, upscale));
         }
+    }
+    let task_count = tasks.len();
+    if task_count == 0 {
+        return;
+    }
+
+    let mut results: Vec<(usize, Option<(String, f32)>)> =
+        if config.parallel_font_rerun && task_count > 1 {
+            let workers = std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1)
+                .clamp(1, 4)
+                .min(task_count);
+            let mut chunks = vec![Vec::new(); workers];
+            for (slot, task) in tasks.into_iter().enumerate() {
+                chunks[slot % workers].push(task);
+            }
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        scope.spawn(move || -> Vec<(usize, Option<(String, f32)>)> {
+                            chunk
+                                .into_iter()
+                                .map(|(index, page, bbox, upscale)| {
+                                    (index, refiner.refine(page, &bbox, upscale))
+                                })
+                                .collect()
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(task_count);
+                for handle in handles {
+                    out.extend(handle.join().expect("worker font-rerun panik"));
+                }
+                out
+            })
+        } else {
+            tasks
+                .into_iter()
+                .map(|(index, page, bbox, upscale)| (index, refiner.refine(page, &bbox, upscale)))
+                .collect()
+        };
+    results.sort_by_key(|(index, _)| *index);
+
+    // Apply dalam urutan indeks asli supaya log dan teks akhir deterministik.
+    for (index, result) in results {
+        let Some((candidate, confidence)) = result else {
+            continue;
+        };
+        let word = &mut words[index];
+        let candidate = candidate.trim().to_string();
+        if candidate.is_empty() || candidate == word.text {
+            continue;
+        }
+        // Crop judul boleh di-upscale, tapi kandidat yang jauh lebih pendek
+        // hampir selalu potongan bbox (mis. `LinnSequencer` → `e`), bukan
+        // koreksi. Batasi penyusutan paling banyak satu karakter.
+        let before_len = word.text.chars().count();
+        let after_len = candidate.chars().count();
+        if after_len < 2 || after_len + 1 < before_len {
+            continue;
+        }
+        if confidence <= word.confidence + config.min_confidence_gain {
+            continue;
+        }
+        let before = word.text.clone();
+        word.text = candidate;
+        word.confidence = confidence;
+        push_log(log, word, &before, &word.text, "large-font-rerun");
     }
 }
 

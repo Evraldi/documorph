@@ -103,11 +103,16 @@ dimatikan dengan nilai `0`, `false`, `no`, atau `off`:
 | `DOCUMORPH_OCR_POSTPROCESS` | Matikan/aktifkan seluruh koreksi + penulisan ulang layer |
 | `DOCUMORPH_OCR_ROTATION` | Deteksi orientasi Tesseract OSD (`--psm 0`) dan putar gambar sebelum OCR |
 | `DOCUMORPH_OCR_DICTIONARY` | Koreksi ejaan sangat konservatif + `1s`→`is` dan `pedai,`→`pedal,` |
+| `DOCUMORPH_OCR_FONT_RERUN` | OCR ulang kata judul/font besar pada 600 DPI (default aktif) |
+| `DOCUMORPH_OCR_FONT_RERUN_SKIP_SAFE` | Lewati OCR ulang untuk kata umum/merek/angka yang sudah confidence ≥ 90 (default aktif) |
+| `DOCUMORPH_OCR_PARALLEL_PAGES` | OCR halaman paralel, maximal 4 worker; otomatis sequential bila ada halaman > 40 MP (default aktif) |
+| `DOCUMORPH_OCR_PARALLEL_FONT_RERUN` | OCR ulang judul paralel, maximal 4 worker; hasil di-apply urut supaya deterministik (default aktif) |
 | `DOCUMORPH_OCR_LAYOUT` | Pertahankan urutan Tesseract; analisis blok XY-cut + bullet satu blok |
 | `DOCUMORPH_OCR_BULLET` | Normalisasi bullet margin kiri + sisipkan bullet yang gagal terdeteksi |
 | `DOCUMORPH_OCR_HYPHEN` | Pertahankan dua fragmen hyphen tanpa duplikasi kata |
 | `DOCUMORPH_OCR_FRACTION` | `312”`/`3½ÿ` → `3½″` hanya di konteks "disk drive"; `32` tidak disentuh |
 | `DOCUMORPH_OCR_RENDER_DPI` | DPI render OCR (minimum 300) |
+| `DOCUMORPH_OCR_RAW_BGR` | Render langsung RGB 3-channel tanpa konversi RGBA→RGB (default aktif) |
 | `DOCUMORPH_OCR_RERENDER_DPI` | DPI crop untuk OCR ulang font besar outlier |
 | `DOCUMORPH_OCR_DICTIONARY_EXTRA` | Kata tambahan yang dikecualikan, dipisah `,` atau `;` |
 
