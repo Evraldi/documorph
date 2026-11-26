@@ -715,6 +715,183 @@ fn settle_engine_output(output: &Path, dir: &Path, ext: &str) -> Result<(), Stri
     Ok(())
 }
 
+/// Rute OCR untuk PDF→DOCX bisa dimatikan tanpa menghapus engine.
+fn pdf_docx_ocr_enabled() -> bool {
+    !matches!(
+        std::env::var("DOCUMORPH_PDF_DOCX_OCR")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
+/// `canonicalize()` di Windows menghasilkan prefiks `\\?\`. Path itu aman
+/// sebagai argv, tapi tidak diterima Tesseract saat mencari `tessdata`.
+fn plain_windows_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn pdf_docx_ocr_engines() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    Some((
+        tesseract_path()?,
+        ocrmypdf_path()?,
+        ghostscript_path()?,
+        pandoc_path()?,
+    ))
+}
+
+/// PDF digital tetap memakai rute lama. Halaman dengan text layer (termasuk
+/// invisible text) dianggap sudah punya teks.
+fn pdf_has_extractable_text(app: &AppHandle, source: &Path) -> Result<bool, String> {
+    let pdfium = pdfium_instance(app)?;
+    let document = pdfium
+        .load_pdf_from_file(source, None)
+        .map_err(|e| format!("PDF tidak dapat dibuka: {e}"))?;
+    for page in document.pages().iter().take(8) {
+        let text = page
+            .text()
+            .map_err(|e| format!("Gagal membaca teks PDF: {e}"))?
+            .all();
+        if !text.trim().is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Dua kandidat OCR dijalankan untuk PDF scan. Confidence Tesseract memutuskan
+/// mana yang dipakai: render langsung kita atau sidecar OCRmyPDF yang lebih
+/// tahan terhadap tabel dan halaman terputar.
+fn choose_docx_ocr_text(
+    pdfium: &Pdfium,
+    source: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+    dir: &Path,
+) -> Result<(&'static str, String), String> {
+    let (tesseract, ocrmypdf, ghostscript, _) = pdf_docx_ocr_engines().ok_or_else(|| {
+        format!(
+            "Engine OCR/Pandoc tidak lengkap untuk PDF→DOCX scan (tesseract={}, ocrmypdf={}, ghostscript={}, pandoc={}).",
+            tesseract_path().is_some(),
+            ocrmypdf_path().is_some(),
+            ghostscript_path().is_some(),
+            pandoc_path().is_some()
+        )
+    })?;
+    let config = ocr_postprocess::PostprocessConfig::from_env();
+    let document = pdfium
+        .load_pdf_from_file(source, None)
+        .map_err(|e| format!("PDF tidak dapat dibuka: {e}"))?;
+
+    let mut direct_text = String::new();
+    let mut confidence_total = 0.0f32;
+    let mut confidence_words = 0usize;
+
+    for page_index in 0..document.pages().len() {
+        let page = document
+            .pages()
+            .get(page_index)
+            .map_err(|e| format!("Halaman PDF gagal dibaca: {e}"))?;
+        let width = ((page.width().value / 72.0) * config.render_dpi as f32)
+            .round()
+            .max(1.0) as usize;
+        let height = ((page.height().value / 72.0) * config.render_dpi as f32)
+            .round()
+            .max(1.0) as usize;
+        let bitmap = page
+            .render_with_config(
+                &PdfRenderConfig::new()
+                    .set_target_size(width as i32, height as i32)
+                    .set_format(PdfBitmapFormat::BGR)
+                    .set_reverse_byte_order(true),
+            )
+            .map_err(|e| format!("Gagal render halaman {}: {e}", page_index + 1))?;
+        let raw = bitmap.as_raw_bytes();
+        let stride = raw.len() / height.max(1);
+        let row_bytes = width * 3;
+        let mut rgb = Vec::with_capacity(row_bytes * height);
+        for row in raw.chunks_exact(stride) {
+            rgb.extend_from_slice(&row[..row_bytes]);
+        }
+
+        let mut ppm = Vec::with_capacity(32 + rgb.len());
+        ppm.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
+        ppm.extend_from_slice(&rgb);
+        let ppm_path = dir.join(format!("direct-{page_index}.ppm"));
+        std::fs::write(&ppm_path, ppm).map_err(|e| format!("Gagal menulis gambar OCR: {e}"))?;
+
+        let stem = dir.join(format!("direct-{page_index}"));
+        let tsv = stem.with_extension("tsv");
+        let mut command = Command::new(&tesseract);
+        command
+            .arg(&ppm_path)
+            .arg(&stem)
+            .args(["-l", "ind+eng", "--psm", "3", "tsv"]);
+        run_engine_for_output(&mut command, "Tesseract", &tsv, cancel, None)?;
+        let tsv_text = std::fs::read_to_string(&tsv)
+            .map_err(|e| format!("Gagal membaca hasil Tesseract: {e}"))?;
+        let words = ocr_layer::parse_tsv(&tsv_text, (page_index + 1) as usize);
+        let confidences: Vec<f32> = words
+            .iter()
+            .filter(|word| word.confidence >= 0.0)
+            .map(|word| word.confidence)
+            .collect();
+        let mean = confidences.iter().sum::<f32>() / confidences.len().max(1) as f32;
+        confidence_total += mean * confidences.len().max(1) as f32;
+        confidence_words += confidences.len();
+        let (processed, corrections) = ocr_postprocess::postprocess(words, &config, None);
+        for correction in corrections {
+            eprintln!(
+                "[PDF→DOCX OCR] halaman {}: {} → {} ({})",
+                correction.page, correction.before, correction.after, correction.rule
+            );
+        }
+        if !direct_text.is_empty() {
+            direct_text.push_str("\n\n");
+        }
+        direct_text.push_str(&ocr_layer::words_to_text(&processed));
+    }
+
+    let sidecar = dir.join("ocrmypdf.txt");
+    let ocr_pdf = dir.join("ocrmypdf.pdf");
+    let tesseract_dir = plain_windows_path(tesseract.parent().unwrap_or_else(|| Path::new("")));
+    let ghostscript_dir = plain_windows_path(ghostscript.parent().unwrap_or_else(|| Path::new("")));
+    let search_path = std::env::join_paths(vec![
+        tesseract_dir.clone(),
+        ghostscript_dir,
+        engines::system32_dir(),
+    ])
+    .map_err(|e| format!("PATH engine tidak valid: {e}"))?;
+    let tessdata = tesseract_dir.join("tessdata");
+    let mut command = Command::new(&ocrmypdf);
+    command
+        .env("PATH", search_path)
+        .env("TESSDATA_PREFIX", &tessdata)
+        .args(["-l", "ind+eng", "--deskew", "--rotate-pages", "--force-ocr"])
+        .arg("--sidecar")
+        .arg(&sidecar)
+        .arg(source)
+        .arg(&ocr_pdf);
+    run_engine_for_output(&mut command, "OCRmyPDF", &ocr_pdf, cancel, None)?;
+    let ocrmypdf_text = std::fs::read_to_string(&sidecar)
+        .map_err(|e| format!("Gagal membaca sidecar OCRmyPDF: {e}"))?;
+
+    let confidence = confidence_total / confidence_words.max(1) as f32;
+    eprintln!("[PDF→DOCX OCR] confidence={confidence:.2}");
+    if confidence >= 85.0 {
+        Ok(("Tesseract + Pandoc", direct_text))
+    } else {
+        Ok(("OCRmyPDF + Pandoc", ocrmypdf_text))
+    }
+}
+
 #[tauri::command(async)]
 fn convert_file(
     app: AppHandle,
@@ -930,7 +1107,14 @@ fn convert_file(
         ["md", "markdown", "html", "htm", "txt", "epub", "tex"].contains(&ext.as_str());
     let pandoc_output = ["docx", "md", "html", "txt", "odt", "rtf"].contains(&target_ext);
     let office_output = ["pdf", "docx", "odt", "rtf"].contains(&target_ext);
-    let route_supported = if pdf_input && target_ext == "docx" && pdf2docx_path().is_some() {
+    let scan_docx_ocr = pdf_input
+        && target_ext == "docx"
+        && pdf_docx_ocr_enabled()
+        && pdf_docx_ocr_engines().is_some()
+        && !pdf_has_extractable_text(&app, source)?;
+    let pdf_docx_route =
+        pdf_input && target_ext == "docx" && (scan_docx_ocr || pdf2docx_path().is_some());
+    let route_supported = if pdf_docx_route {
         true
     } else if target_ext == "md" {
         anymd_path().is_some()
@@ -964,8 +1148,31 @@ fn convert_file(
         ));
     }
 
-    let (engine, tier, warning) = if pdf_input && target_ext == "docx" && pdf2docx_path().is_some()
-    {
+    let (engine, tier, warning) = if scan_docx_ocr {
+        let work = tempfile::Builder::new()
+            .prefix("documorph-docx-ocr-")
+            .tempdir_in(staged_dir.as_path())
+            .map_err(|e| format!("Gagal membuat folder OCR DOCX: {e}"))?;
+        let pdfium = pdfium_instance(&app)?;
+        let (chosen_engine, text) = choose_docx_ocr_text(&pdfium, source, &cancel, work.path())?;
+        let markdown = work.path().join("ocr.md");
+        std::fs::write(&markdown, text).map_err(|e| format!("Gagal menulis teks OCR: {e}"))?;
+        let pandoc = pandoc_path().ok_or("Pandoc tidak ditemukan.")?;
+        let mut command = Command::new(pandoc);
+        command.arg(&markdown).arg("-o").arg(&output);
+        run_engine_for_output(
+            &mut command,
+            "Pandoc",
+            &output,
+            &cancel,
+            Some((staged_dir.as_path(), target_ext)),
+        )?;
+        (
+            chosen_engine,
+            "B",
+            Some("PDF scan tanpa teks; DOCX disusun dari teks OCR. Tabel, angka, dan tata letak bisa perlu koreksi.".into()),
+        )
+    } else if pdf_input && target_ext == "docx" && pdf2docx_path().is_some() {
         let converter = pdf2docx_path().ok_or("pdf2docx tidak ditemukan.")?;
         let mut command = Command::new(&converter);
         command.args(pdf2docx_convert_args(source, &output));
@@ -1516,5 +1723,571 @@ mod tests {
         assert!(!openable_path(&exe));
         assert!(!openable_path(&dir));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn diag_engine_path(env: &str, discovered: Option<PathBuf>, fallback: &str) -> PathBuf {
+        std::env::var_os(env)
+            .map(PathBuf::from)
+            .or(discovered)
+            .unwrap_or_else(|| PathBuf::from(fallback))
+    }
+
+    /// Path engine untuk benchmark. Bisa dioverride lewat env supaya mesin
+    /// dengan install portable tetap bisa menjalankan tes ignored ini.
+    #[allow(clippy::type_complexity)]
+    fn diag_engines() -> (
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+    ) {
+        let paths = engines::engine_paths();
+        (
+            diag_engine_path(
+                "PDF2DOCX_PATH",
+                paths.pdf2docx,
+                r"C:\Users\Evraldi\AppData\Local\Temp\opencode\pdfdocx-venv\Scripts\pdf2docx.exe",
+            ),
+            diag_engine_path(
+                "ANYMD_PATH",
+                paths.anymd,
+                r"C:\Users\Evraldi\AppData\Roaming\npm\anymd.cmd",
+            ),
+            diag_engine_path(
+                "PANDOC_PATH",
+                paths.pandoc,
+                r"C:\Users\Evraldi\AppData\Local\Pandoc\pandoc.exe",
+            ),
+            diag_engine_path(
+                "LIBREOFFICE_PATH",
+                paths.libreoffice,
+                r"C:\Program Files\LibreOffice\program\soffice.exe",
+            ),
+            diag_engine_path(
+                "OCRMYPDF_PATH",
+                paths.ocrmypdf,
+                r"C:\Data\01_Development\python3.10.11\Scripts\ocrmypdf.exe",
+            ),
+            diag_engine_path(
+                "TESSERACT_PATH",
+                paths.tesseract,
+                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            ),
+            diag_engine_path(
+                "GHOSTSCRIPT_PATH",
+                paths.ghostscript,
+                r"C:\Program Files\gs\gs10.08.0\bin\gswin64c.exe",
+            ),
+        )
+    }
+
+    fn diag_run(label: &str, command: &mut Command, expected: &Path) -> f32 {
+        crate::process::hide_console(command);
+        let started = Instant::now();
+        let result = command
+            .output()
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+        let seconds = started.elapsed().as_secs_f32();
+        assert!(
+            result.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&result.stderr)
+                .chars()
+                .take(400)
+                .collect::<String>()
+        );
+        assert!(expected.is_file(), "{label}: output {expected:?} tidak ada");
+        seconds
+    }
+
+    fn diag_unescape(value: &str) -> String {
+        value
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    }
+
+    fn diag_count_tag(xml: &str, name: &str) -> usize {
+        let open = format!("<{name}");
+        xml.match_indices(&open)
+            .filter(|(index, _)| {
+                matches!(
+                    xml.as_bytes().get(index + open.len()),
+                    Some(b'>' | b' ' | b'/')
+                )
+            })
+            .count()
+    }
+
+    /// Ambang teks + bentuk dari DOCX hasil konversi. Cukup untuk membandingkan
+    /// rute secara relatif tanpa bergantung pada library DOCX tambahan.
+    fn diag_docx_summary(path: &Path) -> (String, usize, usize, usize, usize) {
+        use std::io::Read;
+
+        let file = std::fs::File::open(path).expect("buka docx");
+        let mut archive = zip::ZipArchive::new(file).expect("zip docx");
+        let mut xml = String::new();
+        archive
+            .by_name("word/document.xml")
+            .expect("document.xml")
+            .read_to_string(&mut xml)
+            .expect("baca document.xml");
+
+        let bytes = xml.as_bytes();
+        let mut text = String::new();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if bytes[index..].starts_with(b"<w:t") {
+                let after = index + 4;
+                if matches!(bytes.get(after), Some(b'>' | b' '))
+                    && let Some(gap) = bytes[after..].iter().position(|byte| *byte == b'>')
+                {
+                    let start = after + gap + 1;
+                    if let Some(end) = bytes[start..]
+                        .windows(6)
+                        .position(|window| window == b"</w:t>")
+                    {
+                        text.push_str(&diag_unescape(&xml[start..start + end]));
+                        index = start + end + 6;
+                        continue;
+                    }
+                }
+            }
+            if bytes[index..].starts_with(b"</w:p>") {
+                text.push('\n');
+                index += 6;
+                continue;
+            }
+            index += 1;
+        }
+
+        (
+            text,
+            diag_count_tag(&xml, "w:tbl"),
+            diag_count_tag(&xml, "w:tr"),
+            diag_count_tag(&xml, "w:tc"),
+            diag_count_tag(&xml, "w:drawing") + diag_count_tag(&xml, "w:pict"),
+        )
+    }
+
+    fn diag_pdfium() -> Pdfium {
+        let dll = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin/pdfium.dll");
+        Pdfium::new(Pdfium::bind_to_library(&dll).expect("PDFium DLL"))
+    }
+
+    /// OCR langsung memakai pipeline Searchable PDF kita: render BGR 300 DPI,
+    /// Tesseract sekali jalan, lalu koreksi kata sebelum jadi teks.
+    fn diag_direct_text(
+        pdfium: &Pdfium,
+        tesseract: &Path,
+        source: &Path,
+        dir: &Path,
+    ) -> (String, f32, f32) {
+        let pdf = pdfium
+            .load_pdf_from_file(source, None)
+            .expect("buka PDF untuk OCR");
+        let config = ocr_postprocess::PostprocessConfig::from_env();
+        let started = Instant::now();
+        let mut combined = String::new();
+        let mut confidence_total = 0.0f32;
+        let mut confidence_words = 0usize;
+
+        for page_index in 0..pdf.pages().len() {
+            let page = pdf.pages().get(page_index).expect("halaman");
+            let width = ((page.width().value / 72.0) * config.render_dpi as f32)
+                .round()
+                .max(1.0) as usize;
+            let height = ((page.height().value / 72.0) * config.render_dpi as f32)
+                .round()
+                .max(1.0) as usize;
+            let bitmap = page
+                .render_with_config(
+                    &PdfRenderConfig::new()
+                        .set_target_size(width as i32, height as i32)
+                        .set_format(PdfBitmapFormat::BGR)
+                        .set_reverse_byte_order(true),
+                )
+                .expect("render halaman");
+            let raw = bitmap.as_raw_bytes();
+            let stride = raw.len() / height.max(1);
+            let row_bytes = width * 3;
+            let mut rgb = Vec::with_capacity(row_bytes * height);
+            for row in raw.chunks_exact(stride) {
+                rgb.extend_from_slice(&row[..row_bytes]);
+            }
+            let mut ppm = Vec::with_capacity(32 + rgb.len());
+            ppm.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
+            ppm.extend_from_slice(&rgb);
+            let ppm_path = dir.join(format!("direct-page-{page_index}.ppm"));
+            std::fs::write(&ppm_path, ppm).expect("tulis PPM");
+
+            let mut command = Command::new(tesseract);
+            command
+                .arg(&ppm_path)
+                .arg("stdout")
+                .args(["-l", "ind+eng", "--psm", "3", "tsv"]);
+            crate::process::hide_console(&mut command);
+            let result = command.output().expect("jalankan Tesseract");
+            assert!(
+                result.status.success(),
+                "Tesseract: {}",
+                String::from_utf8_lossy(&result.stderr)
+                    .chars()
+                    .take(400)
+                    .collect::<String>()
+            );
+            let tsv = String::from_utf8_lossy(&result.stdout).into_owned();
+            let words = ocr_layer::parse_tsv(&tsv, (page_index + 1) as usize);
+            let confidences: Vec<f32> = words
+                .iter()
+                .filter(|word| word.confidence >= 0.0)
+                .map(|word| word.confidence)
+                .collect();
+            let mean_confidence = confidences.iter().sum::<f32>() / confidences.len().max(1) as f32;
+            confidence_total += mean_confidence * confidences.len().max(1) as f32;
+            confidence_words += confidences.len();
+            let (processed, _) = ocr_postprocess::postprocess(words, &config, None);
+            if !combined.is_empty() {
+                combined.push_str("\n\n");
+            }
+            combined.push_str(&ocr_layer::words_to_text(&processed));
+        }
+
+        let mean = confidence_total / confidence_words.max(1) as f32;
+        (combined, started.elapsed().as_secs_f32(), mean)
+    }
+
+    /// Sidecar OCRmyPDF seperti rute OCR Text produksi. Dipakai sebagai
+    /// kandidat teks alternatif sebelum dirakit jadi DOCX dengan Pandoc.
+    fn diag_ocrmypdf_text(
+        ocrmypdf: &Path,
+        tesseract: &Path,
+        ghostscript: &Path,
+        source: &Path,
+        dir: &Path,
+    ) -> (String, f32) {
+        let sidecar = dir.join("ocrmypdf.txt");
+        let output = dir.join("ocrmypdf.pdf");
+        let path = std::env::join_paths([
+            tesseract.parent().expect("dir tesseract"),
+            ghostscript.parent().expect("dir ghostscript"),
+            Path::new(r"C:\Windows\System32"),
+        ])
+        .expect("PATH engine");
+        let mut command = Command::new(ocrmypdf);
+        command
+            .env("PATH", path)
+            .args(["-l", "ind+eng", "--deskew", "--rotate-pages", "--force-ocr"])
+            .arg("--sidecar")
+            .arg(&sidecar)
+            .arg(source)
+            .arg(&output);
+        let seconds = diag_run("ocrmypdf sidecar", &mut command, &output);
+        let text = std::fs::read_to_string(&sidecar).expect("baca sidecar OCRmyPDF");
+        (text, seconds)
+    }
+
+    /// Buat PDF dengan invisible text layer memakai OCRmyPDF, sebagai input
+    /// untuk pdf2docx --ocr=2 (mode "baca teks tersembunyi saja").
+    fn diag_searchable_pdf(
+        ocrmypdf: &Path,
+        tesseract: &Path,
+        ghostscript: &Path,
+        source: &Path,
+        dir: &Path,
+    ) -> (PathBuf, f32) {
+        let output = dir.join("searchable.pdf");
+        let path = std::env::join_paths([
+            tesseract.parent().expect("dir tesseract"),
+            ghostscript.parent().expect("dir ghostscript"),
+            Path::new(r"C:\Windows\System32"),
+        ])
+        .expect("PATH engine");
+        let mut command = Command::new(ocrmypdf);
+        command
+            .env("PATH", path)
+            .args(["-l", "ind+eng", "--skip-text", "--sidecar"])
+            .arg(dir.join("sidecar.txt"))
+            .arg(source)
+            .arg(&output);
+        let seconds = diag_run("ocrmypdf skip-text", &mut command, &output);
+        (output, seconds)
+    }
+
+    /// Benchmark rute PDF -> DOCX. Default empat sample representatif; set
+    /// DOCUMORPH_PDFDOCX_DOCS=all untuk menjalankan sebelas sample.
+    #[test]
+    #[ignore = "butuh pdf2docx, AnyMD, Pandoc, LibreOffice, OCRmyPDF + PDF sample"]
+    fn pdf_to_docx_route_diagnostic() {
+        let (pdf2docx, anymd, pandoc, lo, ocrmypdf, tesseract, ghostscript) = diag_engines();
+        let selected = std::env::var("DOCUMORPH_PDFDOCX_DOCS")
+            .unwrap_or_else(|_| "image-only-no-text,id-clean,id-table,id-two-column".into());
+        let names: Vec<String> = selected
+            .split(',')
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
+        let documents = ocr_metrics::cross_documents();
+        let pdfium = diag_pdfium();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut anymd_path_parts = vec![
+            tesseract.parent().expect("dir tesseract").to_path_buf(),
+            PathBuf::from(r"C:\Windows\System32"),
+        ];
+        if let Some(existing) = std::env::var_os("PATH") {
+            anymd_path_parts.extend(std::env::split_paths(&existing));
+        }
+        let anymd_path = std::env::join_paths(anymd_path_parts).expect("PATH untuk AnyMD");
+
+        for name in names {
+            let document = documents
+                .iter()
+                .find(|item| item.name == name.as_str())
+                .unwrap_or_else(|| panic!("sample PDF tidak dikenal: {name}"));
+            let dir = temp.path().join(&name);
+            std::fs::create_dir_all(&dir).expect("dir sample");
+            println!("\n== {name} ==");
+
+            let report = |label: &str, seconds: f32, docx: &Path| {
+                let (text, tables, rows, cells, images) = diag_docx_summary(docx);
+                println!(
+                    "{label:<17} {seconds:6.2}s CER={:.4} WER={:.4} words={:<5} tbl={tables}/{rows}/{cells} img={images}",
+                    ocr_metrics::cer(&document.reference, &text),
+                    ocr_metrics::wer(&document.reference, &text),
+                    ocr_metrics::normalize_for_metrics(&text)
+                        .split_whitespace()
+                        .count(),
+                );
+            };
+
+            // Rute produksi saat ini when pdf2docx tersedia.
+            let out = dir.join("pdf2docx.docx");
+            let mut command = Command::new(&pdf2docx);
+            command.args(pdf2docx_convert_args(&document.pdf, &out));
+            let seconds = diag_run("pdf2docx", &mut command, &out);
+            report("pdf2docx", seconds, &out);
+
+            // Mode pdf2docx yang hanya membaca hidden text layer.
+            let out = dir.join("pdf2docx-ocr2.docx");
+            let mut command = Command::new(&pdf2docx);
+            command
+                .args(pdf2docx_convert_args(&document.pdf, &out))
+                .arg("--ocr=2");
+            let seconds = diag_run("pdf2docx ocr=2", &mut command, &out);
+            report("pdf2docx-ocr2", seconds, &out);
+
+            // Fallback produksi: AnyMD -> Pandoc.
+            let markdown = dir.join("anymd.md");
+            let out = dir.join("anymd.docx");
+            let mut command = Command::new(&anymd);
+            command
+                .env("PATH", &anymd_path)
+                .arg(&document.pdf)
+                .arg("-o")
+                .arg(&markdown);
+            let extract_seconds = diag_run("anymd", &mut command, &markdown);
+            let mut command = Command::new(&pandoc);
+            command.arg(&markdown).arg("-o").arg(&out);
+            let build_seconds = diag_run("pandoc", &mut command, &out);
+            report("anymd-pandoc", extract_seconds + build_seconds, &out);
+
+            // AnyMD dengan OCR Tesseract eksplisit -> Pandoc.
+            let markdown = dir.join("anymd-tesseract.md");
+            let out = dir.join("anymd-tesseract.docx");
+            let mut command = Command::new(&anymd);
+            command
+                .env("PATH", &anymd_path)
+                .arg(&document.pdf)
+                .arg("-o")
+                .arg(&markdown)
+                .args(["--ocr", "tesseract"]);
+            let extract_seconds = diag_run("anymd tesseract", &mut command, &markdown);
+            let mut command = Command::new(&pandoc);
+            command.arg(&markdown).arg("-o").arg(&out);
+            let build_seconds = diag_run("pandoc", &mut command, &out);
+            report("anymd-ocr", extract_seconds + build_seconds, &out);
+
+            // OCR langsung pipeline kita -> Markdown -> Pandoc -> DOCX.
+            let direct_dir = dir.join("direct");
+            std::fs::create_dir_all(&direct_dir).expect("dir direct");
+            let (direct_text, ocr_seconds, _) =
+                diag_direct_text(&pdfium, &tesseract, &document.pdf, &direct_dir);
+            let markdown = direct_dir.join("direct.md");
+            std::fs::write(&markdown, direct_text).expect("tulis markdown OCR");
+            let out = direct_dir.join("direct.docx");
+            let mut command = Command::new(&pandoc);
+            command.arg(&markdown).arg("-o").arg(&out);
+            let build_seconds = diag_run("pandoc direct", &mut command, &out);
+            report("direct-pandoc", ocr_seconds + build_seconds, &out);
+
+            // Sidecar OCRmyPDF -> Markdown -> Pandoc -> DOCX.
+            let ocrmypdf_dir = dir.join("ocrmypdf");
+            std::fs::create_dir_all(&ocrmypdf_dir).expect("dir ocrmypdf");
+            let (ocr_text, ocr_seconds) = diag_ocrmypdf_text(
+                &ocrmypdf,
+                &tesseract,
+                &ghostscript,
+                &document.pdf,
+                &ocrmypdf_dir,
+            );
+            let markdown = ocrmypdf_dir.join("ocrmypdf.md");
+            std::fs::write(&markdown, ocr_text).expect("tulis markdown OCRmyPDF");
+            let out = ocrmypdf_dir.join("ocrmypdf.docx");
+            let mut command = Command::new(&pandoc);
+            command.arg(&markdown).arg("-o").arg(&out);
+            let build_seconds = diag_run("pandoc ocrmypdf", &mut command, &out);
+            report("ocrmypdf-pandoc", ocr_seconds + build_seconds, &out);
+
+            // Rute cadangan LibreOffice Draw -> Writer.
+            let profile = tempfile::Builder::new()
+                .prefix("documorph-lo-")
+                .tempdir()
+                .expect("profile LO");
+            let profile_url = libreoffice_profile_url(profile.path());
+            let html_dir = dir.join("lo-html");
+            std::fs::create_dir_all(&html_dir).expect("dir html");
+            let stem = safe_stem(
+                document
+                    .pdf
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("output"),
+            );
+            let html = html_dir.join(format!("{stem}.html"));
+            let mut command = Command::new(&lo);
+            command
+                .arg(format!("-env:UserInstallation={profile_url}"))
+                .args(["--headless", "--convert-to", "html", "--outdir"])
+                .arg(&html_dir)
+                .arg(&document.pdf);
+            let draw_seconds = diag_run("lo draw", &mut command, &html);
+            let out_dir = dir.join("lo-out");
+            std::fs::create_dir_all(&out_dir).expect("dir out LO");
+            let out = out_dir.join(format!("{stem}.docx"));
+            let mut command = Command::new(&lo);
+            command
+                .arg(format!("-env:UserInstallation={profile_url}"))
+                .args([
+                    "--headless",
+                    "--infilter=HTML (StarWriter)",
+                    "--convert-to",
+                    "docx",
+                    "--outdir",
+                ])
+                .arg(&out_dir)
+                .arg(&html);
+            let writer_seconds = diag_run("lo writer", &mut command, &out);
+            report("lo-writer", draw_seconds + writer_seconds, &out);
+
+            // OCR dulu jadi PDF searchable, lalu baca hidden text-nya saja.
+            let pre_dir = dir.join("preocr");
+            std::fs::create_dir_all(&pre_dir).expect("dir preocr");
+            let (searchable, ocr_seconds) =
+                diag_searchable_pdf(&ocrmypdf, &tesseract, &ghostscript, &document.pdf, &pre_dir);
+            let out = pre_dir.join("p2d.docx");
+            let mut command = Command::new(&pdf2docx);
+            command
+                .args(pdf2docx_convert_args(&searchable, &out))
+                .arg("--ocr=2");
+            let convert_seconds = diag_run("preocr p2d", &mut command, &out);
+            report("preocr-p2d", ocr_seconds + convert_seconds, &out);
+        }
+    }
+
+    /// Cari sinyal pemilih direct vs OCRmyPDF tanpa melihat ground truth.
+    #[test]
+    #[ignore = "butuh Tesseract + OCRmyPDF + 11 PDF sample"]
+    fn pdf_to_docx_selector_diagnostic() {
+        let (_, _, _, _, ocrmypdf, tesseract, ghostscript) = diag_engines();
+        let pdfium = diag_pdfium();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut correct = 0usize;
+
+        for document in ocr_metrics::cross_documents() {
+            let dir = temp.path().join(document.name);
+            std::fs::create_dir_all(&dir).expect("dir sample");
+            let (direct_text, _, confidence) =
+                diag_direct_text(&pdfium, &tesseract, &document.pdf, &dir);
+            let (ocr_text, _) =
+                diag_ocrmypdf_text(&ocrmypdf, &tesseract, &ghostscript, &document.pdf, &dir);
+            let direct_cer = ocr_metrics::cer(&document.reference, &direct_text);
+            let ocr_cer = ocr_metrics::cer(&document.reference, &ocr_text);
+            let chosen = if confidence >= 85.0 { "direct" } else { "ocr" };
+            let chosen_cer = if confidence >= 85.0 {
+                direct_cer
+            } else {
+                ocr_cer
+            };
+            let best = direct_cer.min(ocr_cer);
+            if chosen_cer <= best + 1e-6 {
+                correct += 1;
+            }
+            println!(
+                "{:<20} conf={confidence:6.2} direct={direct_cer:.4}/{:<5} ocr={ocr_cer:.4}/{:<5} pilih={chosen:<6} CER={chosen_cer:.4}",
+                document.name,
+                ocr_metrics::normalize_for_metrics(&direct_text)
+                    .split_whitespace()
+                    .count(),
+                ocr_metrics::normalize_for_metrics(&ocr_text)
+                    .split_whitespace()
+                    .count(),
+            );
+        }
+        println!("SELECTOR BENAR: {correct}/11");
+    }
+
+    /// Tes runtime untuk fungsi produksi yang dipakai `convert_file`, bukan
+    /// helper diagnosa. Jalankan dengan environment OCR default.
+    #[test]
+    #[ignore = "butuh Tesseract + OCRmyPDF + 11 PDF sample nyata"]
+    fn pdf_to_docx_scan_route_matches_ground_truth() {
+        let pdfium = diag_pdfium();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let limits: &[(&str, f64)] = &[
+            ("image-only-no-text", 0.01),
+            ("id-clean", 0.0),
+            ("id-noisy", 0.0),
+            ("id-skew", 0.0),
+            ("id-table", 0.16),
+            ("id-lowres", 0.0),
+            ("id-blur", 0.0),
+            ("id-rot90", 0.0),
+            ("id-table-skew", 0.22),
+            ("id-two-column", 0.0),
+            ("id-linn-noise", 0.02),
+        ];
+
+        for document in ocr_metrics::cross_documents() {
+            let max_cer = limits
+                .iter()
+                .find(|(name, _)| *name == document.name)
+                .map(|(_, cer)| *cer)
+                .expect("batas CER untuk sample");
+            let dir = temp.path().join(document.name);
+            std::fs::create_dir_all(&dir).expect("dir sample");
+            let (engine, text) = choose_docx_ocr_text(&pdfium, &document.pdf, &cancel, &dir)
+                .expect("rute OCR PDF→DOCX");
+            let cer = ocr_metrics::cer(&document.reference, &text);
+            println!(
+                "{:<20} engine={engine:<18} CER={cer:.4} batas={max_cer:.4}",
+                document.name
+            );
+            assert!(
+                !text.contains('\u{00FF}'),
+                "{}: teks OCR mengandung U+00FF",
+                document.name
+            );
+            assert!(
+                cer <= max_cer,
+                "{}: CER {cer:.4} melebihi batas {max_cer:.4}",
+                document.name
+            );
+        }
     }
 }

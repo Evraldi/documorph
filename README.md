@@ -37,19 +37,17 @@ divalidasi ulang di backend sebelum proses dijalankan.
 | Tab | Input | Output | Engine | Tier |
 | --- | --- | --- | --- | --- |
 | Office ↔ PDF | DOC/DOCX/ODT/RTF | PDF | LibreOffice | A |
-| Office ↔ PDF | PDF | DOCX | pdf2docx → AnyMD + Pandoc → LibreOffice Draw+Writer | B/C |
-| Office ↔ PDF | PDF | TXT/ODT/RTF | LibreOffice Draw → Writer | C |
-| Office ↔ PDF | PDF | HTML | LibreOffice Draw | C |
+| Office ↔ PDF | PDF | DOCX | PDF scan: Tesseract/OCRmyPDF + Pandoc; digital: pdf2docx → AnyMD + Pandoc → LibreOffice Draw+Writer | B/C |
 | Any → Markdown | PDF, Office, Markdown, HTML, TXT, EPUB, TeX, dll. | Markdown | AnyMD | B |
-| Alat PDF | PDF | DOCX | pdf2docx → AnyMD + Pandoc → LibreOffice Draw+Writer | B/C |
+| Alat PDF | PDF | DOCX | PDF scan: Tesseract/OCRmyPDF + Pandoc; digital: pdf2docx → AnyMD + Pandoc → LibreOffice Draw+Writer | B/C |
 | Alat PDF | PDF | Searchable PDF / OCR Text | OCRmyPDF + Tesseract + Ghostscript | B/C |
 | Format lain | Markdown/HTML/TXT/TeX/EPUB/DOCX/ODT/RTF | DOCX/Markdown/HTML/TXT/ODT/RTF | Pandoc | B |
 | Format lain | Markdown/HTML/TXT/TeX/EPUB | PDF | Pandoc + Typst | B |
 
 Tier A/B/C adalah indikasi risiko perubahan layout; laporan per konversi
 menjelaskan keterbatasan rute yang dipilih. LibreOffice tidak bisa mengekspor
-PDF langsung ke DOCX/ODT/TXT/RTF, jadi rute cadangannya mengimpor PDF sebagai
-HTML lewat Draw lalu membukanya di Writer dengan filter eksplisit.
+PDF langsung ke DOCX/ODT/TXT/RTF, jadi rute cadangannya adalah LibreOffice Draw → Writer:
+PDF diimpor sebagai HTML lewat Draw lalu dibuka di Writer dengan filter eksplisit.
 
 ### Searchable PDF
 
@@ -115,6 +113,28 @@ dimatikan dengan nilai `0`, `false`, `no`, atau `off`:
 | `DOCUMORPH_OCR_RAW_BGR` | Render langsung RGB 3-channel tanpa konversi RGBA→RGB (default aktif) |
 | `DOCUMORPH_OCR_RERENDER_DPI` | DPI crop untuk OCR ulang font besar outlier |
 | `DOCUMORPH_OCR_DICTIONARY_EXTRA` | Kata tambahan yang dikecualikan, dipisah `,` atau `;` |
+
+### PDF → DOCX
+
+PDF scan tanpa text layer tidak lagi dikirim ke pdf2docx/AnyMD yang hanya
+menghasilkan gambar. Dua kandidat teks dijalankan: render langsung 300 DPI dengan
+Tesseract + koreksi kata yang sama seperti Searchable PDF, dan sidecar OCRmyPDF
+(`--deskew --rotate-pages --force-ocr`) yang lebih tahan pada tabel serta halaman
+terputar. Confidence rata-rata Tesseract memilih kandidat; pemilih ini cocok dengan
+ground truth 11/11 sample. PDF yang sudah punya text layer tetap memakai rute
+pdf2docx/AnyMD seperti sebelumnya.
+
+Setiap koreksi kata dicatat dengan format `Halaman n: sebelum → sesudah (rule)`.
+Rute OCR bisa dikembalikan ke perilaku lama dengan:
+
+| Variable | Fungsi |
+| --- | --- |
+| `DOCUMORPH_PDF_DOCX_OCR` | `0` mematikan rute OCR untuk PDF scan (default aktif) |
+
+Pass koreksi mengikuti flag `DOCUMORPH_OCR_*` di atas. Engine harus terdeteksi
+(Tesseract, Ghostscript, OCRmyPDF, Pandoc); bila auto-discovery gagal, path bisa
+diisi lewat `TESSERACT_PATH`, `GHOSTSCRIPT_PATH`, `OCRMYPDF_PATH`, dan
+`PANDOC_PATH`.
 
 ### Diagnosa akurasi OCR
 
